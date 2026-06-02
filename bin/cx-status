@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# cx-status — Render a one-line status for a cxpod window.
+#
+# Invoked in the bottom tmux pane of a cxpod session:
+#   cx-status cx-1
+# Prints one line per refresh (no clear-screen) so tmux's own redraw
+# controls the display. Reads:
+#   1. ~/.cxpod/state/<id>.json           provider/model
+#   2. ~/.cxpod/codex-homes/<id>/sessions/YYYY/MM/DD/rollout-*.jsonl
+#      (latest token_count event)        context %
+set -euo pipefail
+
+SCRIPT_DIR="$(
+  src="${BASH_SOURCE[0]}"
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+)"
+
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+cx-status <window_id> [--once] [--interval N]
+
+  --once            Render one line then exit
+  --interval N      Refresh every N seconds (default 2)
+EOF
+}
+
+ONCE=0
+INTERVAL=2
+WINDOW_ID=""
+
+while (( $# )); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --once) ONCE=1; shift ;;
+    --interval)
+      [[ $# -ge 2 ]] || die "--interval 需要参数"
+      INTERVAL="$2"; shift 2 ;;
+    -*) die "未知选项: $1" ;;
+    *)
+      [[ -z "$WINDOW_ID" ]] || die "只能指定一个 window id"
+      WINDOW_ID="$1"; shift ;;
+  esac
+done
+
+[[ -n "$WINDOW_ID" ]] || { usage; exit 1; }
+is_valid_window_id "$WINDOW_ID" || die "window id 非法: $WINDOW_ID"
+
+ensure_runtime_dirs
+
+WINDOW_HOME="$CXPOD_HOMES_DIR/$WINDOW_ID"
+
+# Find the latest rollout-*.jsonl under this window's codex-home.
+latest_session_file() {
+  local base="$WINDOW_HOME/sessions"
+  [[ -d "$base" ]] || return 1
+  # Portable: find + sort by mtime, take last
+  find "$base" -type f -name 'rollout-*.jsonl' -print0 2>/dev/null |
+    xargs -0 stat -f '%m %N' 2>/dev/null |
+    sort -n |
+    tail -1 |
+    awk '{ $1=""; sub(/^ /, ""); print }'
+}
+
+# Extract the last token_count event from a session file.
+# Returns "<used>|<window>" or empty on failure.
+read_token_count() {
+  local file="$1"
+  [[ -f "$file" ]] || return 1
+  python3 - "$file" <<'PYEOF' 2>/dev/null || true
+import json, sys
+last = None
+with open(sys.argv[1]) as f:
+    for line in f:
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        if ev.get('type') != 'event_msg':
+            continue
+        p = ev.get('payload') or {}
+        if p.get('type') != 'token_count':
+            continue
+        last = p
+if not last:
+    sys.exit(0)
+info = last.get('info') or {}
+used = (info.get('last_token_usage') or {}).get('total_tokens')
+win  = info.get('model_context_window')
+if used is None or not win:
+    sys.exit(0)
+print(f'{used}|{win}')
+PYEOF
+}
+
+# Draw a 10-cell progress bar.
+render_bar() {
+  local pct="$1"
+  local filled=$(( pct / 10 ))
+  (( filled > 10 )) && filled=10
+  (( filled < 0 )) && filled=0
+  local empty=$(( 10 - filled ))
+  local bar=""
+  local i
+  for (( i=0; i<filled; i++ )); do bar+="█"; done
+  for (( i=0; i<empty;  i++ )); do bar+="░"; done
+  printf '%s' "$bar"
+}
+
+render_line() {
+  local provider model
+  provider="$(read_window_state_field "$WINDOW_ID" provider 2>/dev/null || echo "?")"
+  model="$(read_window_state_field "$WINDOW_ID" model 2>/dev/null || echo "?")"
+  [[ -z "$provider" ]] && provider="?"
+  [[ -z "$model" ]] && model="?"
+
+  local badge; badge="$(cxpod_badge "$provider" 2>/dev/null || printf '%s' "$provider")"
+  local user="${USER:-$(whoami)}"
+
+  local ctx_part="Context ░░░░░░░░░░ --%"
+  local sfile tok
+  sfile="$(latest_session_file 2>/dev/null || true)"
+  if [[ -n "$sfile" ]]; then
+    tok="$(read_token_count "$sfile" || true)"
+    if [[ -n "$tok" ]]; then
+      local used win pct
+      used="${tok%%|*}"
+      win="${tok##*|}"
+      if [[ "$used" =~ ^[0-9]+$ ]] && [[ "$win" =~ ^[0-9]+$ ]] && (( win > 0 )); then
+        pct=$(( used * 100 / win ))
+        (( pct > 100 )) && pct=100
+        ctx_part="Context $(render_bar "$pct") ${pct}%"
+      fi
+    fi
+  fi
+
+  printf '#%s [%s|%s] | %s | %s\n' \
+    "$WINDOW_ID" "$model" "$badge" "$user" "$ctx_part"
+}
+
+if (( ONCE )); then
+  render_line
+  exit 0
+fi
+
+# Loop: write one line per interval. tmux pane doesn't need clearing because
+# history scrolls naturally; but for a single-line pane we want the same line
+# to be overwritten. Use a CR + clear-line sequence.
+while :; do
+  printf '\r\033[2K'
+  render_line | tr -d '\n'
+  sleep "$INTERVAL"
+done

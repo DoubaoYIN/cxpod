@@ -1,0 +1,513 @@
+#!/usr/bin/env bash
+# cx-app-switch — 切换 Codex.app（GUI 应用）的 provider，并重启它。
+# 改动 ~/.codex/config.toml 的 model_provider，并把 ~/.codex/sessions/ 下
+# 所有 rollout JSONL 第一行的 model_provider 标签改成新值，
+# 这样 Codex.app 重启后历史侧栏依然能看到全部以前的会话。
+#
+# 用法:
+#   cx-app-switch <provider>            切换并重启 Codex.app
+#   cx-app-switch --no-restart <p>      仅改配置和元数据，不重启
+#   cx-app-switch --no-rewrite <p>      不改写历史 rollout 的 provider 标签
+#   cx-app-switch --list                列出可用 provider
+#
+# 与 cxuse 的区别：
+#   cxuse 操作 ~/.cxpod/codex-homes/cx-N/（每个 tmux window 隔离的 CODEX_HOME）
+#   cx-app-switch 操作 ~/.codex/（Codex.app GUI 实际读取的位置）
+
+set -euo pipefail
+
+SCRIPT_DIR="$(
+  src="${BASH_SOURCE[0]}"
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+)"
+
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+cx-app-switch — 切换 Codex.app（GUI）provider 并重启
+
+USAGE
+  cx-app-switch <provider>          切换并重启 Codex.app
+  cx-app-switch --no-restart <p>    仅改配置和元数据，不重启
+  cx-app-switch --no-rewrite <p>    不改写历史 rollout 元数据
+  cx-app-switch --list, -l          列出可用 provider
+  cx-app-switch --help, -h
+EOF
+}
+
+NO_RESTART=0
+NO_REWRITE=0
+PROVIDER_ARG=""
+
+while (( $# )); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -l|--list) ensure_runtime_dirs; list_providers; exit 0 ;;
+    --no-restart) NO_RESTART=1; shift ;;
+    --no-rewrite) NO_REWRITE=1; shift ;;
+    --) shift; break ;;
+    -*) die "未知选项: $1" ;;
+    *)
+      [[ -z "$PROVIDER_ARG" ]] || die "只能指定一个 provider"
+      PROVIDER_ARG="$1"; shift ;;
+  esac
+done
+
+[[ -n "$PROVIDER_ARG" ]] || { usage; exit 1; }
+
+ensure_runtime_dirs
+
+CONFIG="$CXPOD_USER_CODEX_HOME/config.toml"
+SESSIONS_DIR="$CXPOD_USER_CODEX_HOME/sessions"
+STATE_DB="$CXPOD_USER_CODEX_HOME/state_5.sqlite"
+
+[[ -f "$CONFIG" ]] || die "Codex.app 配置不存在: $CONFIG"
+
+require_cmd python3
+
+NAME="$(resolve_provider "$PROVIDER_ARG")"
+PFILE="$(provider_file "$NAME")"
+KIND="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('kind','relay'))" "$PFILE" 2>/dev/null || echo relay)"
+APP_SWITCH_BACKUP_ROOT=""
+
+prepare_app_switch_backup() {
+  [[ -n "$APP_SWITCH_BACKUP_ROOT" ]] && return 0
+  local stamp parent root
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  parent="$CXPOD_USER_CODEX_HOME/cxpod-app-switch-backups"
+  root="$parent/$stamp"
+  mkdir -p "$root/rollout-first-lines"
+  chmod 700 "$parent" "$root" "$root/rollout-first-lines" 2>/dev/null || true
+  APP_SWITCH_BACKUP_ROOT="$root"
+}
+
+backup_file_if_exists() {
+  local source="$1" name="$2"
+  [[ -f "$source" ]] || return 0
+  prepare_app_switch_backup
+  cp -p "$source" "$APP_SWITCH_BACKUP_ROOT/$name" 2>/dev/null || cp "$source" "$APP_SWITCH_BACKUP_ROOT/$name"
+  chmod 600 "$APP_SWITCH_BACKUP_ROOT/$name" 2>/dev/null || true
+}
+
+backup_state_db_if_needed() {
+  [[ -f "$STATE_DB" ]] || return 0
+  (( ! NO_REWRITE )) || return 0
+  prepare_app_switch_backup
+  local dest="$APP_SWITCH_BACKUP_ROOT/state_5.sqlite"
+  if python3 - "$STATE_DB" "$dest" <<'PY'
+import sqlite3
+import sys
+
+src, dst = sys.argv[1:3]
+with sqlite3.connect(src) as source, sqlite3.connect(dst) as target:
+    source.backup(target)
+PY
+  then
+    chmod 600 "$dest" 2>/dev/null || true
+  else
+    warn "state_5.sqlite 备份失败，跳过历史元数据改写"
+    NO_REWRITE=1
+  fi
+}
+
+backup_app_switch_state() {
+  backup_file_if_exists "$CONFIG" "config.toml"
+  backup_file_if_exists "$CXPOD_USER_CODEX_HOME/auth.json" "auth.json"
+  backup_state_db_if_needed
+  [[ -n "$APP_SWITCH_BACKUP_ROOT" ]] && info "🧯 已备份 Codex.app 状态到: $APP_SWITCH_BACKUP_ROOT"
+}
+
+# Quit Codex.app first so we can rewrite rollout JSONLs and the threads
+# sqlite without racing the app's writers. The app spawns several helper
+# processes (Electron renderers, crashpad_handler, Codex Helper, app-server,
+# node_repl, MCP children); they hold open file descriptors on
+# ~/.codex/state_5.sqlite-wal. We need ALL of them gone before we touch
+# the database, otherwise sqlite returns SQLITE_BUSY or our writes get
+# rolled back when the helper finally flushes.
+codex_main_running() {
+  pgrep -fq "/Applications/Codex.app/Contents/MacOS/Codex" 2>/dev/null
+}
+codex_any_running() {
+  pgrep -fq "/Applications/Codex.app/" 2>/dev/null
+}
+
+signal_codex_pids() {
+  # Send $1 (TERM or KILL) to every process still rooted under
+  # /Applications/Codex.app/. Re-query PIDs each call so we don't miss
+  # processes that have been re-parented or spawned mid-shutdown.
+  # The key target here is `codex app-server`, which caches auth.json in
+  # memory — leaving it alive defeats the entire provider switch.
+  local sig="$1" pids
+  pids="$(pgrep -f "/Applications/Codex.app/" 2>/dev/null || true)"
+  if [[ -n "$pids" ]]; then
+    # shellcheck disable=SC2086
+    kill -"$sig" $pids 2>/dev/null || true
+  fi
+}
+
+wait_while_running() {
+  # Poll codex_any_running every 0.5s up to $1 iterations; return as soon
+  # as all processes are gone.
+  local max="$1" i
+  for (( i=0; i<max; i++ )); do
+    codex_any_running || return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+WAS_RUNNING=0
+if codex_any_running; then
+  WAS_RUNNING=1
+  if (( NO_RESTART )); then
+    warn "Codex.app 正在运行，--no-restart 模式下跳过元数据改写以避免冲突"
+    NO_REWRITE=1
+  else
+    # Phase 1: graceful quit via AppleEvent. Wait up to 8s for ALL
+    # Codex.app processes to exit — not just the main one. The
+    # `codex app-server` child holds auth.json in memory; if it survives
+    # but the main process dies, the switch silently fails.
+    osascript -e 'tell application "Codex" to quit' >/dev/null 2>&1 || true
+    wait_while_running 16 || true
+
+    # Phase 2: SIGTERM stragglers, up to 6s.
+    if codex_any_running; then
+      attempt=0
+      while codex_any_running && (( attempt < 12 )); do
+        signal_codex_pids TERM
+        sleep 0.5
+        attempt=$((attempt + 1))
+      done
+    fi
+
+    # Phase 3: SIGKILL anything that still refuses to die, up to 3s.
+    if codex_any_running; then
+      warn "SIGTERM 未清空 Codex.app 进程，升级到 SIGKILL"
+      attempt=0
+      while codex_any_running && (( attempt < 10 )); do
+        signal_codex_pids KILL
+        sleep 0.3
+        attempt=$((attempt + 1))
+      done
+    fi
+
+    # Hard gate: if anything is still alive, refuse to continue. Writing
+    # config.toml while app-server is running leaves the old auth cached
+    # in memory and `open -a Codex` just foregrounds the existing app
+    # instead of restarting it — exactly the bug this phase prevents.
+    if codex_any_running; then
+      survivors="$(pgrep -fl '/Applications/Codex.app/' 2>/dev/null || true)"
+      die "无法终止 Codex.app 进程，请手动 Cmd+Q 后重试。存活进程:
+$survivors"
+    fi
+  fi
+fi
+
+sync_oauth_authority_from_codex_home "$CXPOD_USER_CODEX_HOME"
+backup_app_switch_state
+sync_auth_json "$CXPOD_USER_CODEX_HOME" "$KIND" "$NAME"
+
+# Patch config.toml synchronously before relaunching. This keeps the app's
+# provider, auth.json, sqlite thread index, and rollout metadata in one state.
+python3 - "$NAME" "$PFILE" "$CONFIG" <<'PY'
+import sys, json, os, re, tempfile
+
+new_provider, pfile, config_path = sys.argv[1:4]
+
+if pfile:
+    with open(pfile) as f:
+        pdata = json.load(f)
+    default_model = pdata.get('default_model') or ''
+    mp_toml = pdata.get('model_provider_toml') or {}
+    kind = pdata.get('kind') or 'relay'
+else:
+    default_model = ''
+    mp_toml = {}
+    kind = 'relay'
+
+ENV_RE = re.compile(r'\$\{ENV:([A-Za-z_][A-Za-z0-9_]*)\}')
+CXPOD_ONLY_KEYS = {'api_key', 'env_key', 'requires_openai_auth'}
+
+def resolve(v):
+    if isinstance(v, str):
+        m = ENV_RE.fullmatch(v)
+        return os.environ.get(m.group(1), '') if m else v
+    return v
+
+def toml_escape(s):
+    return '"' + str(s).replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+with open(config_path, 'r', encoding='utf-8') as f:
+    config = f.read()
+
+def replace_top_level_str(text, key, value):
+    pattern = re.compile(
+        rf'(?m)^(?P<key>{re.escape(key)}[ \t]*=[ \t]*)"(?:\\.|[^"\\])*"[ \t]*$'
+    )
+    head_end = len(text)
+    section_match = re.search(r'(?m)^\[', text)
+    if section_match:
+        head_end = section_match.start()
+    head, tail = text[:head_end], text[head_end:]
+    if pattern.search(head):
+        head = pattern.sub(rf'\g<key>{toml_escape(value)}', head, count=1)
+    else:
+        if head and not head.endswith('\n'):
+            head += '\n'
+        head += f'{key} = {toml_escape(value)}\n'
+    return head + tail
+
+config = replace_top_level_str(config, 'model_provider', new_provider)
+if default_model:
+    config = replace_top_level_str(config, 'model', default_model)
+
+section_re = re.compile(
+    rf'(?ms)^\[model_providers\.{re.escape(new_provider)}\]\s*$.*?(?=^\[|\Z)'
+)
+# `openai` is a built-in provider ID in recent Codex releases; redefining
+# it under [model_providers.openai] makes Codex refuse to start with
+# "reserved built-in provider IDs". Skip section emission for built-ins
+# and for `official` kind (which relies on OAuth, not a provider block).
+BUILTIN_PROVIDERS = {'openai'}
+is_builtin = new_provider in BUILTIN_PROVIDERS or kind == 'official'
+def provider_block():
+    block_lines = [f'[model_providers.{new_provider}]']
+    for k, raw in mp_toml.items():
+        if k in CXPOD_ONLY_KEYS:
+            continue
+        v = resolve(raw)
+        if v in (None, ''):
+            continue
+        if isinstance(v, bool):
+            block_lines.append(f'{k} = {"true" if v else "false"}')
+        elif isinstance(v, (int, float)):
+            block_lines.append(f'{k} = {v}')
+        else:
+            block_lines.append(f'{k} = {toml_escape(v)}')
+    return '\n'.join(block_lines).rstrip() + '\n'
+
+if is_builtin:
+    # Also strip any existing stale section for this provider.
+    config = section_re.sub('', config).rstrip() + '\n'
+else:
+    block = provider_block()
+    if section_re.search(config):
+        config = section_re.sub(block, config)
+    else:
+        block = '\n' + block
+        if not config.endswith('\n'):
+            config += '\n'
+        config += block
+
+cfg_dir = os.path.dirname(config_path)
+fd, tmp = tempfile.mkstemp(dir=cfg_dir, prefix='.config.toml.')
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write(config)
+    os.replace(tmp, config_path)
+except Exception:
+    try: os.unlink(tmp)
+    except OSError: pass
+    raise
+PY
+
+rewrite_rollouts_sync() {
+  local sessions_dir="$1" provider="$2" backup_root="${3:-}"
+  [[ -d "$sessions_dir" ]] || return 0
+  python3 - "$sessions_dir" "$provider" "$backup_root" <<'PY'
+# Rewrite each rollout JSONL's first-line `payload.model_provider` in place.
+# New JSON is encoded compactly and padded with trailing spaces to match the
+# ORIGINAL first-line byte length, so we can `seek(0); write()` without
+# touching the (potentially multi-GB) rest of the file. The line stays
+# valid JSON because parsers ignore whitespace after the closing brace.
+# If the new JSON is longer than the original line (very rare — only when
+# the new provider name is significantly longer), fall back to a tmp+rename
+# copy for that one file.
+import sys, os, json, glob, tempfile, uuid
+sessions_dir, new_provider, backup_root = sys.argv[1], sys.argv[2], sys.argv[3]
+rewritten = 0
+skipped = 0
+errors = 0
+pattern = os.path.join(sessions_dir, '**', 'rollout-*.jsonl')
+
+def backup_first_line(path, first):
+    if not backup_root:
+        return True
+    try:
+        rollout_dir = os.path.join(backup_root, 'rollout-first-lines')
+        os.makedirs(rollout_dir, exist_ok=True)
+        try:
+            os.chmod(rollout_dir, 0o700)
+        except OSError:
+            pass
+        name = f'{uuid.uuid4()}.jsonl'
+        line_path = os.path.join(rollout_dir, name)
+        with open(line_path, 'wb') as out:
+            out.write(first)
+        try:
+            os.chmod(line_path, 0o600)
+        except OSError:
+            pass
+        manifest = os.path.join(backup_root, 'rollout-manifest.tsv')
+        with open(manifest, 'a', encoding='utf-8') as out:
+            out.write(f'{name}\t{path}\n')
+        try:
+            os.chmod(manifest, 0o600)
+        except OSError:
+            pass
+        return True
+    except OSError:
+        return False
+
+for path in glob.iglob(pattern, recursive=True):
+    try:
+        with open(path, 'rb') as f:
+            first = f.readline()
+        if not first.strip():
+            continue
+        try:
+            meta = json.loads(first.decode('utf-8'))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        payload = meta.get('payload')
+        if not isinstance(payload, dict) or 'model_provider' not in payload:
+            continue
+        if payload['model_provider'] == new_provider:
+            skipped += 1
+            continue
+        payload['model_provider'] = new_provider
+        # Compact form gives us the most slack for padding.
+        new_json = json.dumps(meta, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+        target_len = len(first)  # includes the trailing '\n'
+        new_line = new_json + b'\n'
+        if len(new_line) <= target_len:
+            if not backup_first_line(path, first):
+                errors += 1
+                continue
+            pad = target_len - len(new_line)
+            new_line = new_json + (b' ' * pad) + b'\n'
+            with open(path, 'r+b') as f:
+                f.seek(0)
+                f.write(new_line)
+            rewritten += 1
+        else:
+            # Fallback: full copy. Only happens when new_json doesn't fit.
+            if not backup_first_line(path, first):
+                errors += 1
+                continue
+            d = os.path.dirname(path)
+            fd, tmp = tempfile.mkstemp(dir=d, prefix='.rollout.')
+            try:
+                with os.fdopen(fd, 'wb') as out, open(path, 'rb') as src:
+                    out.write(new_json + b'\n')
+                    src.readline()  # skip original first line
+                    while True:
+                        chunk = src.read(1 << 20)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                os.replace(tmp, path)
+                rewritten += 1
+            except Exception:
+                try: os.unlink(tmp)
+                except OSError: pass
+                errors += 1
+    except OSError:
+        errors += 1
+        continue
+print(f'rewrote={rewritten} unchanged={skipped} errors={errors}', file=sys.stderr)
+PY
+}
+
+# Update threads table in state_5.sqlite. Codex.app's history sidebar
+# filters by `threads.model_provider` (independent of the rollout JSONL
+# metadata), so without this UPDATE the sidebar would only show sessions
+# whose recorded provider matches the new one.
+if [[ -f "$STATE_DB" ]] && (( ! NO_REWRITE )); then
+  if codex_any_running; then
+    warn "Codex.app 仍在运行，跳过 threads 表更新（数据库可能被锁定）"
+  else
+    if sqlite3 "$STATE_DB" \
+        "UPDATE threads SET model_provider = '$NAME' WHERE model_provider != '$NAME';" \
+        2>/dev/null; then
+      changed="$(sqlite3 "$STATE_DB" 'SELECT changes();' 2>/dev/null || echo 0)"
+      info "🗂  threads 表 model_provider 统一为 '$NAME'（更新 ${changed} 条）"
+    else
+      warn "threads 表更新失败（数据库可能被锁定）"
+    fi
+  fi
+fi
+
+printf '%s' "$NAME" | atomic_write "$CXPOD_CURRENT_FILE"
+cxpod_badge "$NAME" | atomic_write "$CXPOD_STATUS_FILE"
+
+info "✅ Codex.app provider 已切换为: $(cxpod_badge "$NAME")"
+
+# Optional compatibility path for relay setups that still require GUI-wide
+# launchd env vars. It is disabled by default because those values are visible
+# to every GUI process started from the user's launchd session.
+sync_env_to_launchd() {
+  [[ "${CXPOD_GUI_LAUNCHD_ENV:-0}" == "1" ]] || {
+    info "ℹ️  未向 launchd 注入 provider env（需要兼容旧 relay 时设置 CXPOD_GUI_LAUNCHD_ENV=1）"
+    return 0
+  }
+  command -v launchctl >/dev/null 2>&1 || return 0
+  local key val
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    launchctl unsetenv "$key" 2>/dev/null || true
+  done < <(
+    while IFS= read -r provider_name; do
+      provider_env_names "$provider_name" 2>/dev/null || true
+    done < <(list_providers) | sort -u
+  )
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    val="${!key:-}"
+    [[ -n "$val" ]] || continue
+    launchctl setenv "$key" "$val" 2>/dev/null || true
+  done < <(provider_env_names "$NAME" 2>/dev/null || true)
+}
+sync_env_to_launchd
+
+# Rewrite rollout metadata SYNCHRONOUSLY before relaunching Codex.app.
+# If we started it first, the history sidebar would show an inconsistent
+# view (threads sqlite says all-new-provider, but rollout payloads still
+# say old-provider) until the rewrite finished — user sees sessions
+# appear to vanish and then trickle back. The in-place rewrite below is
+# O(number_of_files), independent of file size.
+if (( ! NO_REWRITE )); then
+  rewrite_rollouts_sync "$SESSIONS_DIR" "$NAME" "$APP_SWITCH_BACKUP_ROOT"
+fi
+
+if (( NO_RESTART )); then
+  if (( WAS_RUNNING )); then
+    info "ℹ️ --no-restart：保留运行中的 Codex.app（重启后才会读到新配置）"
+  else
+    info "ℹ️ --no-restart：未启动 Codex.app"
+  fi
+  exit 0
+fi
+
+open -a "Codex"
+
+# Verify the launch actually started a fresh main process. `open -a`
+# against an already-running app becomes a no-op foreground — if that
+# happens after our kill phase, something revived the app between the
+# hard-gate check and now (rare, but worth catching).
+for _ in 1 2 3 4 5 6; do
+  codex_main_running && break
+  sleep 0.5
+done
+if ! codex_main_running; then
+  warn "Codex.app 启动未检测到主进程，请手动启动"
+else
+  info "🚀 已启动 Codex.app"
+fi

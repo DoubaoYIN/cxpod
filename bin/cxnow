@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# cxnow — Show the current Codex provider for this cxpod window.
+# Part of cxpod: https://github.com/DoubaoYIN/cxpod
+
+set -euo pipefail
+
+SCRIPT_DIR="$(
+  src="${BASH_SOURCE[0]}"
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+)"
+
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+cxnow — 显示当前 cxpod window 的 provider
+
+USAGE
+  cxnow                      纯文本输出 provider id（脚本友好）
+  cxnow --badge              带 emoji 的人类友好格式
+  cxnow --line               status pane 用的完整一行
+  cxnow --list               列出所有 cxpod windows 当前状态
+  cxnow --window <id>        查询指定 window
+  cxnow --help, -h
+EOF
+}
+
+format_status_line() {
+  local id="$1" provider="$2" model="$3"
+  local user; user="${USER:-$(whoami)}"
+  local badge; badge="$(cxpod_badge "$provider")"
+  local model_part="${model:-?}"
+  printf '#%s [%s|%s] | %s' "$id" "$model_part" "$badge" "$user"
+}
+
+cmd_list() {
+  ensure_runtime_dirs
+  local found=0
+  for f in "$CXPOD_STATE_DIR"/cx-*.json; do
+    [[ -f "$f" ]] || continue
+    local id provider model
+    id="$(basename "$f" .json)"
+    provider="$(read_window_state_field "$id" provider || echo "?")"
+    model="$(read_window_state_field "$id" model || echo "")"
+    printf '%s\n' "$(format_status_line "$id" "$provider" "$model")"
+    found=1
+  done
+  if (( found == 0 )); then
+    echo "(没有 cxpod window 在运行)"
+  fi
+}
+
+# Parse args.
+MODE="plain"
+WINDOW_ID="${CXPOD_WINDOW_ID:-}"
+
+while (( $# )); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --badge)   MODE="badge"; shift ;;
+    --line)    MODE="line"; shift ;;
+    --list)    cmd_list; exit 0 ;;
+    --window)
+      [[ $# -ge 2 ]] || die "--window 需要参数"
+      WINDOW_ID="$2"; shift 2 ;;
+    *) die "未知选项: $1" ;;
+  esac
+done
+
+ensure_runtime_dirs
+
+if [[ -n "$WINDOW_ID" ]]; then
+  is_valid_window_id "$WINDOW_ID" || die "window id 非法: $WINDOW_ID"
+  PROVIDER="$(read_window_state_field "$WINDOW_ID" provider 2>/dev/null || true)"
+  MODEL="$(read_window_state_field "$WINDOW_ID" model 2>/dev/null || true)"
+  if [[ -z "$PROVIDER" ]]; then
+    [[ "$MODE" == "plain" ]] && exit 1
+    echo "(window $WINDOW_ID 无状态文件)"
+    exit 1
+  fi
+else
+  [[ -f "$CXPOD_CURRENT_FILE" ]] || { echo "(no provider set)"; exit 1; }
+  PROVIDER="$(cat "$CXPOD_CURRENT_FILE")"
+  MODEL=""
+fi
+
+case "$MODE" in
+  plain) printf '%s\n' "$PROVIDER" ;;
+  badge) printf '%s\n' "$(cxpod_badge "$PROVIDER")" ;;
+  line)
+    if [[ -z "$WINDOW_ID" ]]; then
+      printf '[%s] | %s\n' "$(cxpod_badge "$PROVIDER")" "${USER:-$(whoami)}"
+    else
+      printf '%s\n' "$(format_status_line "$WINDOW_ID" "$PROVIDER" "$MODEL")"
+    fi
+    ;;
+esac

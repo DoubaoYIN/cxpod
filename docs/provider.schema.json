@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/DoubaoYIN/cxpod/blob/main/docs/provider.schema.json",
+  "title": "cxpod provider",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["id", "display_name", "kind", "model_provider_toml"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "display_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "badge_emoji": {
+      "type": "string"
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["official", "relay"]
+    },
+    "default_model": {
+      "type": "string"
+    },
+    "gateway": {
+      "type": "string",
+      "enum": ["sub2api", "newapi", "zenmux", "unknown"]
+    },
+    "notes": {
+      "type": "string"
+    },
+    "model_provider_toml": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["name", "wire_api"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
+        "base_url": {
+          "type": "string"
+        },
+        "wire_api": {
+          "type": "string",
+          "enum": ["responses", "chat"]
+        },
+        "env_key": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "api_key": {
+          "type": "string",
+          "pattern": "^$|^\\$\\{ENV:[A-Za-z_][A-Za-z0-9_]*\\}$"
+        },
+        "requires_openai_auth": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

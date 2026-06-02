@@ -1,0 +1,16 @@
+{
+  "$schema": "../docs/provider.schema.json",
+  "id": "relay",
+  "display_name": "Custom Relay",
+  "badge_emoji": "🔵",
+  "kind": "relay",
+  "model_provider_toml": {
+    "name": "relay",
+    "base_url": "",
+    "wire_api": "responses",
+    "requires_openai_auth": true,
+    "env_key": "RELAY_API_KEY"
+  },
+  "default_model": "",
+  "notes": "Copy to ~/.cxpod/providers/relay.json, fill in base_url + default_model, and set RELAY_API_KEY in ~/.cxpod/env."
+}

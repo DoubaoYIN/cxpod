@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# cxstart — Launch a cxpod tmux session: codex on top, cx-status on bottom.
+# Part of cxpod: https://github.com/DoubaoYIN/cxpod
+#
+# Usage:
+#   cxstart                                  # interactive: pick dir + provider
+#   cxstart -d <dir> -p <provider>           # non-interactive
+#   cxstart --no-tmux                        # emergency bypass (no HUD)
+#   cxstart --attach <cx-N>                  # reattach existing session
+
+set -euo pipefail
+
+SCRIPT_DIR="$(
+  src="${BASH_SOURCE[0]}"
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+)"
+
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+TMUX_CONF="$CXPOD_REPO/tmux/cxpod.conf"
+
+usage() {
+  cat <<'EOF'
+cxstart — 启动一个 cxpod tmux session
+
+USAGE
+  cxstart                          交互模式选项目和 provider
+  cxstart -d <dir> -p <provider>   非交互
+  cxstart --no-tmux                紧急模式，直接 exec codex，无 HUD
+  cxstart --attach <cx-N>          重新附加到已存在 session
+  cxstart --list                   列出正在运行的 cxpod sessions
+  cxstart --kill <cx-N>            关闭某 session 并清理
+  cxstart --help, -h
+
+OPTIONS
+  -d, --dir <path>        工作目录，默认当前目录
+  -p, --provider <name>   provider 名（支持前缀匹配）
+EOF
+}
+
+# Default non-interactive selection if fzf isn't installed.
+pick_with_fzf_or_first() {
+  local prompt="$1"; shift
+  local choices=("$@")
+  if command -v fzf >/dev/null 2>&1; then
+    printf '%s\n' "${choices[@]}" | fzf --prompt="$prompt " --height=40% --border
+  else
+    printf '%s' "${choices[0]}"
+  fi
+}
+
+list_sessions() {
+  ensure_runtime_dirs
+  if ! command -v tmux >/dev/null 2>&1; then
+    die "tmux 未安装"
+  fi
+  local ids=()
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    is_valid_window_id "$name" && ids+=("$name")
+  done < <(tmux list-sessions -F '#S' 2>/dev/null || true)
+
+  if (( ${#ids[@]} == 0 )); then
+    echo "(没有 cxpod session)"
+    return
+  fi
+
+  printf '%-8s  %-10s  %-20s  %-8s  %s\n' "ID" "PROVIDER" "MODEL" "CONTEXT" "PROJECT"
+  printf '%-8s  %-10s  %-20s  %-8s  %s\n' "──" "────────" "─────" "───────" "───────"
+  local id provider model project_dir ctx_pct sfile
+  for id in "${ids[@]}"; do
+    provider="$(read_window_state_field "$id" provider 2>/dev/null || echo "?")"
+    model="$(read_window_state_field "$id" model 2>/dev/null || echo "?")"
+    project_dir="$(read_window_state_field "$id" project_dir 2>/dev/null || echo "")"
+    [[ -n "$project_dir" ]] && project_dir="${project_dir/#$HOME/\~}"
+    ctx_pct="--"
+    sfile="$(latest_session_file "$id" 2>/dev/null || true)"
+    if [[ -n "$sfile" ]]; then
+      local tok
+      tok="$("$SCRIPT_DIR/cx-status" "$id" --once 2>/dev/null | grep -oE '[0-9]+%' || true)"
+      [[ -n "$tok" ]] && ctx_pct="$tok"
+    fi
+    local badge; badge="$(cxpod_badge "$provider" 2>/dev/null || echo "$provider")"
+    printf '%-8s  %-10s  %-20s  %-8s  %s\n' "$id" "$badge" "$model" "$ctx_pct" "$project_dir"
+  done
+}
+
+kill_session() {
+  local id="$1"
+  is_valid_window_id "$id" || die "window id 非法: $id"
+  if command -v tmux >/dev/null 2>&1 && tmux has-session -t "$id" 2>/dev/null; then
+    tmux kill-session -t "$id"
+    info "已关闭 tmux session: $id"
+  fi
+  rm -rf "$CXPOD_HOMES_DIR/$id" "$CXPOD_STATE_DIR/$id.json"
+  info "已清理: $CXPOD_HOMES_DIR/$id"
+}
+
+# Parse args.
+DIR=""
+PROVIDER_ARG=""
+MODE="normal"
+ATTACH_ID=""
+KILL_ID=""
+
+while (( $# )); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -d|--dir) DIR="$2"; shift 2 ;;
+    -p|--provider) PROVIDER_ARG="$2"; shift 2 ;;
+    --no-tmux) MODE="no-tmux"; shift ;;
+    --attach) ATTACH_ID="$2"; MODE="attach"; shift 2 ;;
+    --kill)   KILL_ID="$2";   MODE="kill";   shift 2 ;;
+    --list)   MODE="list"; shift ;;
+    *) die "未知参数: $1" ;;
+  esac
+done
+
+ensure_runtime_dirs
+
+case "$MODE" in
+  list)  list_sessions; exit 0 ;;
+  kill)  kill_session "$KILL_ID"; exit 0 ;;
+  attach)
+    is_valid_window_id "$ATTACH_ID" || die "window id 非法: $ATTACH_ID"
+    exec tmux attach -t "$ATTACH_ID"
+    ;;
+esac
+
+# Resolve working directory.
+if [[ -z "$DIR" ]]; then
+  DIR="$(pwd)"
+fi
+[[ -d "$DIR" ]] || die "目录不存在: $DIR"
+DIR="$(cd -P "$DIR" && pwd)"
+
+# Resolve provider.
+if [[ -z "$PROVIDER_ARG" ]]; then
+  avail=()
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    avail+=("$line")
+  done < <(list_providers)
+  if (( ${#avail[@]} == 0 )); then
+    die "没有可用的 provider。请在 providers/ 或 ~/.cxpod/providers/ 放置 JSON 配置。"
+  fi
+  PROVIDER_ARG="$(pick_with_fzf_or_first 'provider>' "${avail[@]}")"
+fi
+[[ -n "$PROVIDER_ARG" ]] || die "未选择 provider"
+PROVIDER="$(resolve_provider "$PROVIDER_ARG")"
+
+# Non-tmux emergency mode.
+if [[ "$MODE" == "no-tmux" ]]; then
+  TMP_HOME="$(mktemp -d -t cxpod-notmux-XXXXXX)"
+  ln -s "$CXPOD_USER_CODEX_HOME/installation_id" "$TMP_HOME/installation_id" 2>/dev/null || true
+  PFILE="$(provider_file "$PROVIDER")"
+  KIND="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('kind','relay'))" "$PFILE" 2>/dev/null || echo relay)"
+  sync_auth_json "$TMP_HOME" "$KIND" "$PROVIDER"
+  # Write config directly into tmp home (since --window mode expects cx-N)
+  bash -c "source '$SCRIPT_DIR/lib/common.sh' && render_config_toml '$PROVIDER'" > "$TMP_HOME/config.toml"
+  info "🚨 --no-tmux 模式，无 HUD"
+  cd "$DIR"
+  exec env CODEX_HOME="$TMP_HOME" "$CXPOD_CODEX_BIN"
+fi
+
+# Require tmux for normal mode.
+require_cmd tmux
+
+# Allocate a new window id.
+WINDOW_ID="$(allocate_window_id)"
+info "🆕 window id: $WINDOW_ID"
+
+# Prepare the window's CODEX_HOME (symlinks auth etc.) and write config.
+PFILE="$(provider_file "$PROVIDER")"
+KIND="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('kind','relay'))" "$PFILE" 2>/dev/null || echo relay)"
+WINDOW_HOME="$(seed_window_codex_home "$WINDOW_ID" "$KIND" "$PROVIDER")"
+MODEL="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('default_model',''))" "$PFILE" 2>/dev/null || true)"
+render_config_toml "$PROVIDER" | atomic_write "$WINDOW_HOME/config.toml"
+write_window_state "$WINDOW_ID" "$PROVIDER" "$MODEL"
+
+# Build the top-pane codex command. We run codex inside the window's
+# CODEX_HOME with -C pointing at the project directory.
+# Provider JSON may reference secrets via ${ENV:VAR}. cxpod loads ~/.cxpod/env
+# and injects only referenced env vars into the Codex process.
+ENV_ASSIGNMENTS="$(provider_env_assignments "$PROVIDER" | tr '\n' ' ')"
+_CODEX_INNER="${ENV_ASSIGNMENTS}CODEX_HOME=$(printf '%q' "$WINDOW_HOME") $(printf '%q' "$CXPOD_CODEX_BIN") -C $(printf '%q' "$DIR")"
+CODEX_CMD="${SHELL:-/bin/zsh} -lc $(printf '%q' "$_CODEX_INNER")"
+
+# Build the bottom-pane status command. It re-renders every 2s.
+STATUS_CMD="$SCRIPT_DIR/cx-status $WINDOW_ID --interval 2"
+
+# Create the tmux session.
+tmux new-session -d -s "$WINDOW_ID" -x "${COLUMNS:-200}" -y "${LINES:-50}" -n cxpod \
+  "$CODEX_CMD" \; \
+  set-environment -t "$WINDOW_ID" CXPOD_WINDOW_ID "$WINDOW_ID" \; \
+  set-environment -t "$WINDOW_ID" CXPOD_HOME "$CXPOD_HOME"
+
+# Apply our config on top of whatever global tmux config the user has.
+tmux source-file -t "$WINDOW_ID" "$TMUX_CONF" 2>/dev/null || \
+  warn "cxpod.conf 加载失败，继续（用户 tmux 配置会生效）"
+tmux set-environment -t "$WINDOW_ID" '@cxpod_conf' "$TMUX_CONF" 2>/dev/null || true
+
+# Split off a 1-line status pane at the bottom and run cx-status there.
+tmux split-window -t "$WINDOW_ID:0" -v -l 1 -d "$STATUS_CMD"
+
+# Record the tmux reload target (codex pane) into state so `cxuse` can
+# send keys there later. Pane index 0 is top (codex) since we split the
+# window after creating the codex pane — the original becomes index 0.
+TMUX_TARGET="$WINDOW_ID:0.0"
+python3 - <<PYEOF | atomic_write "$CXPOD_STATE_DIR/$WINDOW_ID.json"
+import json
+d = json.load(open("$CXPOD_STATE_DIR/$WINDOW_ID.json"))
+d["tmux_target"] = "$TMUX_TARGET"
+d["project_dir"] = "$DIR"
+print(json.dumps(d, ensure_ascii=False, indent=2))
+PYEOF
+
+info "🚀 启动: $WINDOW_ID ($PROVIDER) @ $DIR"
+exec tmux attach -t "$WINDOW_ID"

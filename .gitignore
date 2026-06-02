@@ -1,0 +1,27 @@
+# cxpod runtime directory — never commit any part of it
+.cxpod/
+~/.cxpod/
+
+# Real provider configs — only *.example.json belongs in repo
+providers/*.json
+!providers/*.example.json
+!providers/openai.json
+
+# Local secrets / overrides
+*.local.json
+*.private.json
+.env
+.env.*
+
+# Swift build artifacts
+menubar/.build/
+menubar/build/
+menubar/.swiftpm/
+*.xcodeproj/
+
+# macOS
+.DS_Store
+
+# Local probe outputs that may contain machine-specific paths
+scripts/probe-output-*.txt
+scripts/probe-output-*.log

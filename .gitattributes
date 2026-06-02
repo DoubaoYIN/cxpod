@@ -1,0 +1,4 @@
+# Keep generated archives focused on files needed by end users.
+.gitignore export-ignore
+.gitattributes export-ignore
+CONTRIBUTING.md export-ignore

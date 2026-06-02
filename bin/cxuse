@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# cxuse — Switch the Codex CLI provider for the current cxpod window.
+# Part of cxpod: https://github.com/DoubaoYIN/cxpod
+
+set -euo pipefail
+
+SCRIPT_DIR="$(
+  src="${BASH_SOURCE[0]}"
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+)"
+
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+cxuse — 切换当前 cxpod window 的 Codex provider
+
+USAGE
+  cxuse <provider>           切换到指定 provider（前缀匹配）
+  cxuse <provider> --cold    冷切换：仅写配置，不重启 codex
+  cxuse --window <id> <p>    指定 window id（默认读 $CXPOD_WINDOW_ID）
+  cxuse --list, -l           列出可用 provider
+  cxuse --help, -h
+
+ENVIRONMENT
+  CXPOD_WINDOW_ID    当前窗口 id（由 cxstart 注入），如 cx-1
+                     未设置时 cxuse 进入 "全局模式" 写 ~/.codex/config.toml
+
+EXAMPLES
+  cxuse openai               # 切换到官方
+  cxuse relay                # 前缀匹配 relay provider
+  cxuse openai --cold        # 仅写配置，不发重启信号
+EOF
+}
+
+list_providers_pretty() {
+  echo "Available providers:"
+  local current=""
+  if [[ -f "$CXPOD_CURRENT_FILE" ]]; then
+    current="$(cat "$CXPOD_CURRENT_FILE")"
+  fi
+  local found=0
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    local marker=""
+    [[ "$name" == "$current" ]] && marker=" (current default)"
+    printf '  - %s  %s%s\n' "$name" "$(cxpod_badge "$name")" "$marker"
+    found=1
+  done < <(list_providers)
+  if (( found == 0 )); then
+    echo "  (no providers installed)"
+  fi
+}
+
+# Parse args.
+COLD=0
+WINDOW_ID="${CXPOD_WINDOW_ID:-}"
+PROVIDER_ARG=""
+
+while (( $# )); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -l|--list) ensure_runtime_dirs; list_providers_pretty; exit 0 ;;
+    --cold) COLD=1; shift ;;
+    --window)
+      [[ $# -ge 2 ]] || die "--window 需要参数"
+      WINDOW_ID="$2"; shift 2 ;;
+    --) shift; break ;;
+    -*) die "未知选项: $1" ;;
+    *)
+      [[ -z "$PROVIDER_ARG" ]] || die "只能指定一个 provider"
+      PROVIDER_ARG="$1"; shift ;;
+  esac
+done
+
+[[ -n "$PROVIDER_ARG" ]] || { usage; exit 1; }
+
+ensure_runtime_dirs
+
+NAME="$(resolve_provider "$PROVIDER_ARG")"
+PFILE="$(provider_file "$NAME")"
+
+# Pull default model and kind from provider JSON.
+MODEL=""
+KIND="relay"
+if command -v jq >/dev/null 2>&1; then
+  MODEL="$(jq -r '.default_model // empty' "$PFILE" 2>/dev/null || true)"
+  KIND="$(jq -r '.kind // "relay"' "$PFILE" 2>/dev/null || true)"
+fi
+
+# Determine target CODEX_HOME and mode.
+if [[ -n "$WINDOW_ID" ]]; then
+  is_valid_window_id "$WINDOW_ID" || die "window id 非法: $WINDOW_ID (期望 cx-N)"
+  TARGET_HOME="$(seed_window_codex_home "$WINDOW_ID" "$KIND" "$NAME")"
+  MODE="window"
+else
+  warn "未检测到 CXPOD_WINDOW_ID，进入全局模式（直接写 $CXPOD_USER_CODEX_HOME/config.toml）"
+  TARGET_HOME="$CXPOD_USER_CODEX_HOME"
+  sync_oauth_authority_from_codex_home "$TARGET_HOME"
+  sync_auth_json "$TARGET_HOME" "$KIND" "$NAME"
+  MODE="global"
+fi
+
+# Render and write config.toml.
+# Before switching, bridge context from the current provider's session
+# so the new provider can pick up the conversation.
+if [[ "$MODE" == "window" ]]; then
+  OLD_PROVIDER="$(read_window_state_field "$WINDOW_ID" "provider" 2>/dev/null || echo "")"
+  if [[ -n "$OLD_PROVIDER" && "$OLD_PROVIDER" != "$NAME" ]]; then
+    if [[ "${CXPOD_CONTEXT_BRIDGE:-0}" == "1" ]]; then
+      bridge_context "$WINDOW_ID" "$OLD_PROVIDER"
+      info "🔗 上下文已保存到 ~/.cxpod/context/ ($OLD_PROVIDER → $NAME)"
+    fi
+  fi
+fi
+TOML_BODY="$(render_config_toml "$NAME")"
+mkdir -p "$TARGET_HOME"
+printf '%s\n' "$TOML_BODY" | atomic_write "$TARGET_HOME/config.toml"
+
+# Update window state + global default file.
+if [[ "$MODE" == "window" ]]; then
+  write_window_state "$WINDOW_ID" "$NAME" "$MODEL"
+fi
+printf '%s' "$NAME" | atomic_write "$CXPOD_CURRENT_FILE"
+cxpod_badge "$NAME" | atomic_write "$CXPOD_STATUS_FILE"
+
+info "✅ provider 已切换为: $(cxpod_badge "$NAME")"
+[[ "$MODE" == "window" ]] && info "   window: $WINDOW_ID"
+info "   config: $TARGET_HOME/config.toml"
+
+# Hot restart: signal cxstart-managed tmux pane to reload.
+# (cxstart writes the tmux target into the state file under reload_target;
+# Phase 2 wires this up. For now we just print the manual command.)
+if (( COLD )); then
+  info "ℹ️  冷切换：未发送重启信号"
+elif [[ "$MODE" == "window" ]]; then
+  reload_target="$(read_window_state_field "$WINDOW_ID" "tmux_target" 2>/dev/null || echo "")"
+  project_dir="$(read_window_state_field "$WINDOW_ID" "project_dir" 2>/dev/null || echo "")"
+  if [[ -n "$reload_target" ]] && command -v tmux >/dev/null 2>&1; then
+    # respawn-pane -k kills whatever is running in the pane and replaces it
+    # with the given command in one shot. This avoids the race where C-c
+    # kills codex, its pane auto-closes, tmux renumbers panes, and our
+    # follow-up send-keys ends up typing into the status pane.
+    dir_flag=""
+    [[ -n "$project_dir" ]] && dir_flag="-C $(printf '%q' "$project_dir") "
+    env_assignments="$(provider_env_assignments "$NAME" | tr '\n' ' ')"
+    codex_cmd="${env_assignments}CODEX_HOME=$(printf '%q' "$TARGET_HOME") $(printf '%q' "$CXPOD_CODEX_BIN") ${dir_flag}resume --last"
+    respawn_cmd="$SHELL -lc $(printf '%q' "$codex_cmd")"
+    if tmux respawn-pane -k -t "$reload_target" "$respawn_cmd" 2>/dev/null; then
+      info "🔁 已重启 tmux $reload_target (resume --last)"
+    else
+      warn "respawn-pane 失败，回退到 send-keys（可能丢失 pane）"
+      tmux send-keys -t "$reload_target" C-c
+      sleep 0.2
+      tmux send-keys -t "$reload_target" "$codex_cmd" Enter
+    fi
+  else
+    info "ℹ️  当前无 tmux 重启目标（cxstart 尚未运行或在全局模式）"
+    info "   手动重启 codex：CODEX_HOME=$TARGET_HOME $CXPOD_CODEX_BIN resume --last"
+  fi
+fi

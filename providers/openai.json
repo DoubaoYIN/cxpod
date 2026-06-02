@@ -1,0 +1,13 @@
+{
+  "$schema": "../docs/provider.schema.json",
+  "id": "openai",
+  "display_name": "OpenAI",
+  "badge_emoji": "⚪",
+  "kind": "official",
+  "model_provider_toml": {
+    "name": "openai",
+    "wire_api": "responses"
+  },
+  "default_model": "gpt-5.5",
+  "notes": "Official OpenAI provider. Uses the login/auth.json stored by `codex login`. No API key needed in this file."
+}
