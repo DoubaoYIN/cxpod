@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.2.1
+
+- Added public relay/provider presets for OpenRouter, SiliconFlow, Together AI, and Groq in the menu bar app.
+- Added an editable Env field when adding providers, with safe default environment variable names.
+- Fixed custom relay env key generation so names like `my-relay` become valid shell variables such as `MY_RELAY_API_KEY`.
+
+## v0.2.0
+
+- Rebuilt the public Git history from a clean root commit.
+- Removed old v0.1.x release tags from the public repository.
+- Kept only the audited, reusable public snapshot for GitHub release.
+
 ## v0.1.4
 
 - Rewrote the README as a zero-background user guide.

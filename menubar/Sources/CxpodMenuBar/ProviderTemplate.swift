@@ -49,6 +49,10 @@ struct ProviderTemplate: Identifiable {
         case "aliyun": return "🟤"
         case "deepseek": return "🔷"
         case "kimi": return "🟡"
+        case "openrouter": return "🟢"
+        case "siliconflow": return "🧊"
+        case "together": return "🟧"
+        case "groq": return "⚡️"
         default: return "🔵"
         }
     }
@@ -73,9 +77,33 @@ struct ProviderTemplate: Identifiable {
             notes: "OpenAI 兼容端点"
         ),
         ProviderTemplate(
+            id: "openrouter", displayName: "OpenRouter", category: .relay,
+            baseURL: "https://openrouter.ai/api/v1", wireAPI: "chat",
+            defaultModel: "openai/gpt-5.2", envKeyName: "OPENROUTER_API_KEY", requiresOpenAIAuth: false,
+            notes: "公开模型路由服务"
+        ),
+        ProviderTemplate(
+            id: "siliconflow", displayName: "SiliconFlow", category: .relay,
+            baseURL: "https://api.siliconflow.cn/v1", wireAPI: "chat",
+            defaultModel: "Pro/zai-org/GLM-4.7", envKeyName: "SILICONFLOW_API_KEY", requiresOpenAIAuth: false,
+            notes: "OpenAI 兼容模型平台"
+        ),
+        ProviderTemplate(
+            id: "together", displayName: "Together AI", category: .relay,
+            baseURL: "https://api.together.ai/v1", wireAPI: "chat",
+            defaultModel: "openai/gpt-oss-20b", envKeyName: "TOGETHER_API_KEY", requiresOpenAIAuth: false,
+            notes: "OpenAI 兼容模型平台"
+        ),
+        ProviderTemplate(
+            id: "groq", displayName: "Groq", category: .relay,
+            baseURL: "https://api.groq.com/openai/v1", wireAPI: "responses",
+            defaultModel: "openai/gpt-oss-20b", envKeyName: "GROQ_API_KEY", requiresOpenAIAuth: false,
+            notes: "OpenAI 兼容高速推理服务"
+        ),
+        ProviderTemplate(
             id: "relay", displayName: "中转站", category: .relay,
             baseURL: "", wireAPI: "responses",
-            defaultModel: "", envKeyName: "", requiresOpenAIAuth: true,
+            defaultModel: "", envKeyName: "RELAY_API_KEY", requiresOpenAIAuth: true,
             notes: "通用中转站，填入 URL 和 Key 即可"
         ),
     ]

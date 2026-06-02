@@ -133,8 +133,22 @@ open /Applications/CxPod.app
 
 1. 打开 `CxPod.app`。
 2. 选择添加线路。
-3. 填入名称、Base URL、API Key、默认模型。
-4. 保存。
+3. 选择一个公开预设，或选择“中转站”手动填写。
+4. 填入名称、Base URL、API Key、默认模型。
+5. 确认 Env 字段；它会写进 provider JSON，并把真实 key 保存到 `~/.cxpod/env`。
+6. 保存。
+
+内置预设只包含公开服务和通用变量名，例如：
+
+| Preset | Env |
+|--------|-----|
+| OpenRouter | `OPENROUTER_API_KEY` |
+| SiliconFlow | `SILICONFLOW_API_KEY` |
+| Together AI | `TOGETHER_API_KEY` |
+| Groq | `GROQ_API_KEY` |
+| 自定义中转站 | `RELAY_API_KEY`，或根据名称自动生成 |
+
+例如自定义名称填 `my-relay` 时，菜单栏 app 会自动建议 `MY_RELAY_API_KEY`。
 
 保存后，cxpod 会把 provider 配置写到 `~/.cxpod/providers/`，把真实 key 写到 `~/.cxpod/env`。
 

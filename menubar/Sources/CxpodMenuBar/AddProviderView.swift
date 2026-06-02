@@ -6,9 +6,11 @@ struct AddProviderView: View {
     @State private var fieldValues: [String: String] = [:]
     @State private var customName: String = ""
     @State private var customBaseURL: String = ""
+    @State private var customEnvKeyName: String = "RELAY_API_KEY"
     @State private var customDefaultModel: String = ""
     @State private var requiresOpenAIAuth: Bool = true
     @State private var apiKeyValue: String = ""
+    @State private var envKeyEdited: Bool = false
     @State private var errorMessage: String?
     var onComplete: (() -> Void)?
 
@@ -29,7 +31,7 @@ struct AddProviderView: View {
             if let tpl = selectedTemplate { formSection(tpl) }
             else { templateList }
         }
-        .frame(width: 340, height: 380)
+        .frame(width: 360, height: 440)
     }
 
     private var header: some View {
@@ -58,11 +60,14 @@ struct AddProviderView: View {
                         ForEach(items, id: \.id) { tpl in
                             Button(action: {
                                 selectedTemplate = tpl
-                                customName = tpl.id == "relay" ? "" : tpl.id
+                                let initialName = tpl.id == "relay" ? "" : tpl.id
+                                customName = initialName
                                 customBaseURL = tpl.baseURL
                                 customDefaultModel = tpl.defaultModel
+                                customEnvKeyName = tpl.envKeyName.isEmpty ? defaultEnvKeyName(for: initialName) : tpl.envKeyName
                                 requiresOpenAIAuth = tpl.requiresOpenAIAuth
                                 apiKeyValue = ""
+                                envKeyEdited = false
                                 errorMessage = nil
                             }) {
                                 HStack {
@@ -101,6 +106,12 @@ struct AddProviderView: View {
                         SecureField("API Key", text: $apiKeyValue).textFieldStyle(.roundedBorder).font(.system(size: 12))
                     }
                     HStack {
+                        Text("Env").frame(width: 50, alignment: .trailing).font(.system(size: 12))
+                        TextField("RELAY_API_KEY", text: envKeyBinding)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 12, design: .monospaced))
+                    }
+                    HStack {
                         Text("模型").frame(width: 50, alignment: .trailing).font(.system(size: 12))
                         TextField("默认模型，可选", text: $customDefaultModel).textFieldStyle(.roundedBorder).font(.system(size: 12))
                     }
@@ -119,6 +130,10 @@ struct AddProviderView: View {
                 Spacer()
             }.padding(.bottom, 12)
         }
+        .onChange(of: customName) { newName in
+            guard tpl.id == "relay", !envKeyEdited else { return }
+            customEnvKeyName = defaultEnvKeyName(for: newName)
+        }
     }
 
     private func save(_ tpl: ProviderTemplate) {
@@ -135,7 +150,10 @@ struct AddProviderView: View {
         let baseURL = tpl.id == "relay" ? customBaseURL : tpl.baseURL
         guard !baseURL.isEmpty else { errorMessage = "请填写 Base URL"; return }
 
-        let envKeyName = tpl.envKeyName.isEmpty ? "\(name.uppercased())_API_KEY" : tpl.envKeyName
+        let envKeyName = customEnvKeyName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isValidEnvKeyName(envKeyName) else {
+            errorMessage = "Env 只能包含字母、数字、下划线，且不能以数字开头"; return
+        }
         var mp: [String: Any] = ["name": name, "base_url": baseURL, "wire_api": tpl.wireAPI]
         if !envKeyName.isEmpty { mp["env_key"] = envKeyName }
         if requiresOpenAIAuth { mp["requires_openai_auth"] = true }
@@ -177,5 +195,15 @@ struct AddProviderView: View {
             try? line.write(to: envFile, atomically: true, encoding: .utf8)
         }
         try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: envFile.path)
+    }
+
+    private var envKeyBinding: Binding<String> {
+        Binding(
+            get: { customEnvKeyName },
+            set: { value in
+                customEnvKeyName = value
+                envKeyEdited = true
+            }
+        )
     }
 }
