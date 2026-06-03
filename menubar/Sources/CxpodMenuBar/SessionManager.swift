@@ -97,6 +97,7 @@ final class SessionManager {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         p.arguments = ["tmux", "has-session", "-t", name]
+        p.environment = cxpodProcessEnvironment()
         p.standardOutput = Pipe()
         p.standardError = Pipe()
         do {

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Made Codex binary discovery prefer `codex` from PATH before falling back to Codex.app.
+- Added install-time checks and README guidance for Codex CLI / Codex.app login.
+- Added GUI PATH handling for menu bar app-launched subprocesses.
+- Added balance-check disclosure and `CXPOD_DISABLE_BALANCE=1`.
+- Removed jq dependency from provider switching and reduced relay key exposure in tmux commands.
+- Hardened shell-to-Python state writes against heredoc interpolation issues.
+
 ## v0.2.1
 
 - Added public relay/provider presets for OpenRouter, SiliconFlow, Together AI, and Groq in the menu bar app.

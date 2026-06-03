@@ -50,11 +50,26 @@ cxpod 做的事情很简单：
 你需要：
 
 - 一台 Mac。
-- 已安装并登录 Codex.app / Codex CLI。
 - 可以打开 Terminal 终端。
 - 网络能访问 GitHub。
+- 已安装 Codex 本体，二选一：
+  - Codex CLI：`npm i -g @openai/codex`
+  - Codex.app
 
-安装脚本会检查 `git`、`tmux`、`python3`、`bash`。如果缺少 `tmux` 或 `python3`，并且你安装了 Homebrew，脚本会询问是否自动安装。
+安装脚本会检查：
+
+| Dependency | 必需 | 用途 |
+|------------|------|------|
+| `git` | 是 | 下载或更新 cxpod 仓库。 |
+| `codex` 或 Codex.app | 是 | 真正运行 Codex。 |
+| `tmux` | 是 | 管理多会话窗口和状态栏。 |
+| `python3` | 是 | 解析 provider JSON、写配置和状态。 |
+| `bash` | 是 | 运行 cxpod 脚本。 |
+| `sqlite3` | 否 | 切换 Codex.app 历史会话分组时使用。 |
+| `fzf` | 否 | 交互选择 provider 更方便。 |
+| `swift` | 否 | 构建菜单栏 app。 |
+
+如果缺少 `tmux` 或 `python3`，并且你安装了 Homebrew，脚本会询问是否自动安装。纯 CLI 用户通常不需要手动设置 `CXPOD_CODEX_BIN`；cxpod 会优先使用 `command -v codex`，找不到时再回退到 Codex.app 内置二进制。
 
 ## 方式一：一行命令安装
 
@@ -86,7 +101,13 @@ bash /tmp/cxpod-install.sh
 
 ## 第一次使用：只用 OpenAI 官方
 
-先确认 Codex.app / Codex CLI 已经登录。然后进入你要工作的项目目录，启动一个会话：
+先完成官方登录。官方 `openai` provider 使用 Codex 的 OAuth 登录态，不读取 API key：
+
+```bash
+codex login
+```
+
+也可以打开 Codex.app，在 app 内完成登录。登录后进入你要工作的项目目录，启动一个会话：
 
 ```bash
 cxstart -d ~/my-project -p openai
@@ -117,6 +138,12 @@ open /Applications/CxPod.app
 ```
 
 如果安装脚本提示安装到了 `~/Applications/CxPod.app`，就打开它提示的路径。
+
+如果你的 `codex` 不在默认 PATH，可以手动指定：
+
+```bash
+export CXPOD_CODEX_BIN="$(command -v codex)"
+```
 
 ## 添加第二条线路：relay / 中转站
 
@@ -221,6 +248,12 @@ cxpod 会做这些事：
 4. 重启当前 Codex pane。
 5. 尝试用 `codex resume --last` 回到上一段会话。
 
+如果你在普通终端里执行 `cxuse`，cxpod 不会默认改写真实 `~/.codex/config.toml`。确实要切换 Codex.app / 全局 CLI 配置时，使用：
+
+```bash
+cxuse --global my-relay
+```
+
 ## 安装脚本选项
 
 普通用户一般不需要设置这些。需要自定义时，可以在命令前加环境变量：
@@ -233,9 +266,11 @@ CXPOD_INSTALL_APP=0 bash install.sh
 |----------|---------|---------|
 | `CXPOD_REPO_DIR` | `~/Projects/cxpod` | 仓库下载/更新位置 |
 | `CXPOD_BIN_DIR` | 自动选择 | CLI 软链接安装目录 |
+| `CXPOD_CODEX_BIN` | 自动探测 | Codex 可执行文件路径 |
 | `CXPOD_INSTALL_APP` | `1` | 是否构建安装菜单栏 app |
 | `CXPOD_OPEN_APP` | `1` | 安装后是否打开菜单栏 app |
 | `CXPOD_INSTALL_HOOKS` | `0` | 是否安装开发用 Git pre-commit hook |
+| `CXPOD_DISABLE_BALANCE` | `0` | 设为 `1` 后禁用菜单栏余额查询 |
 
 ## 卸载
 
@@ -348,6 +383,7 @@ cxuse
 - 调用 `cxstart` / `cxuse`
 - 展示当前 session 和 provider
 - 管理 Codex.app 历史会话分组
+- 对已识别的 relay/provider 可显示余额
 
 核心逻辑仍然在 CLI 脚本里，方便复用和排查。
 
@@ -356,7 +392,9 @@ cxuse
 - 仓库不内置任何第三方中转站密钥或内部 URL。
 - 真实 provider 配置默认放在 `~/.cxpod/providers/`，不进入 Git。
 - 真实 key 推荐放在 `~/.cxpod/env`，并设置为 `600` 权限。
+- relay key 会写入当前 window 专属的 `provider.env`，再由 shell 在本地 source，避免明文 key 出现在 tmux 启动命令行。
 - 渲染 Codex `config.toml` 时跳过 `api_key`、`env_key` 等 cxpod 元数据，避免把 key 展开到额外配置文件。
+- 菜单栏 app 会用本机 `~/.cxpod/env` 中的 key 向你配置的 provider `base_url` 查询余额，默认启动后延迟 5 分钟、之后每小时刷新一次；请求只从本机发往该 provider，不经过 cxpod 作者或其他服务器。要关闭它，在 `~/.cxpod/env` 加入：`CXPOD_DISABLE_BALANCE=1`。
 - 自动上下文桥接默认关闭。需要时设置 `CXPOD_CONTEXT_BRIDGE=1`。
 - 写入项目 `AGENTS.md` 需要额外设置 `CXPOD_CONTEXT_BRIDGE_INJECT_AGENTS=1`。
 - Codex.app GUI 环境变量注入默认关闭。确需兼容旧 relay 时，可设置 `CXPOD_GUI_LAUNCHD_ENV=1`。
@@ -394,9 +432,19 @@ export PATH="$HOME/.local/bin:$PATH"
 bash ~/Projects/cxpod/menubar/build.sh --install
 ```
 
+如果菜单栏能打开但列表为空，请确认 `tmux` 和 `cxstart` 可用：
+
+```bash
+command -v tmux
+command -v cxstart
+cxnow --list
+```
+
 ### 这个项目会上传我的 key 吗？
 
-不会。cxpod 是本地工具，key 保存在你自己的 `~/.cxpod/env`。但 provider 本身会收到 Codex 请求，这是你选择该 provider 时的正常行为。
+不会上传到 cxpod 作者或仓库。cxpod 是本地工具，key 保存在你自己的 `~/.cxpod/env`。但 provider 本身会收到 Codex 请求；菜单栏余额功能也会向你配置的 provider `base_url` 发送带 key 的余额查询请求。关闭余额查询可设置 `CXPOD_DISABLE_BALANCE=1`。
+
+第三方服务名称和商标归各自所有。cxpod 只是本地配置管理工具，不代表与这些服务存在隶属或合作关系。
 
 ### 我适合贡献代码吗？
 

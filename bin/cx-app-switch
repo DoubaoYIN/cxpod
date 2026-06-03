@@ -76,6 +76,7 @@ NAME="$(resolve_provider "$PROVIDER_ARG")"
 PFILE="$(provider_file "$NAME")"
 KIND="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('kind','relay'))" "$PFILE" 2>/dev/null || echo relay)"
 APP_SWITCH_BACKUP_ROOT=""
+CXPOD_CODEX_APP_PROCESS_PATTERN='^/Applications/Codex\.app/'
 
 prepare_app_switch_backup() {
   [[ -n "$APP_SWITCH_BACKUP_ROOT" ]] && return 0
@@ -132,10 +133,10 @@ backup_app_switch_state() {
 # the database, otherwise sqlite returns SQLITE_BUSY or our writes get
 # rolled back when the helper finally flushes.
 codex_main_running() {
-  pgrep -fq "/Applications/Codex.app/Contents/MacOS/Codex" 2>/dev/null
+  pgrep -fq "^/Applications/Codex\.app/Contents/MacOS/Codex" 2>/dev/null
 }
 codex_any_running() {
-  pgrep -fq "/Applications/Codex.app/" 2>/dev/null
+  pgrep -fq "$CXPOD_CODEX_APP_PROCESS_PATTERN" 2>/dev/null
 }
 
 signal_codex_pids() {
@@ -145,7 +146,7 @@ signal_codex_pids() {
   # The key target here is `codex app-server`, which caches auth.json in
   # memory — leaving it alive defeats the entire provider switch.
   local sig="$1" pids
-  pids="$(pgrep -f "/Applications/Codex.app/" 2>/dev/null || true)"
+  pids="$(pgrep -f "$CXPOD_CODEX_APP_PROCESS_PATTERN" 2>/dev/null || true)"
   if [[ -n "$pids" ]]; then
     # shellcheck disable=SC2086
     kill -"$sig" $pids 2>/dev/null || true
@@ -203,7 +204,7 @@ if codex_any_running; then
     # in memory and `open -a Codex` just foregrounds the existing app
     # instead of restarting it — exactly the bug this phase prevents.
     if codex_any_running; then
-      survivors="$(pgrep -fl '/Applications/Codex.app/' 2>/dev/null || true)"
+      survivors="$(pgrep -fl "$CXPOD_CODEX_APP_PROCESS_PATTERN" 2>/dev/null || true)"
       die "无法终止 Codex.app 进程，请手动 Cmd+Q 后重试。存活进程:
 $survivors"
     fi
@@ -434,8 +435,13 @@ if [[ -f "$STATE_DB" ]] && (( ! NO_REWRITE )); then
   if codex_any_running; then
     warn "Codex.app 仍在运行，跳过 threads 表更新（数据库可能被锁定）"
   else
+    SQL_NAME="$(python3 - "$NAME" <<'PY'
+import sys
+print(sys.argv[1].replace("'", "''"))
+PY
+)"
     if sqlite3 "$STATE_DB" \
-        "UPDATE threads SET model_provider = '$NAME' WHERE model_provider != '$NAME';" \
+        "UPDATE threads SET model_provider = '$SQL_NAME' WHERE model_provider != '$SQL_NAME';" \
         2>/dev/null; then
       changed="$(sqlite3 "$STATE_DB" 'SELECT changes();' 2>/dev/null || echo 0)"
       info "🗂  threads 表 model_provider 统一为 '$NAME'（更新 ${changed} 条）"

@@ -31,7 +31,14 @@ CXPOD_AUTH_DIR="$CXPOD_HOME/codex-auth"
 CXPOD_OAUTH_AUTH="$CXPOD_AUTH_DIR/oauth.json"
 CXPOD_CONTEXT_DIR="$CXPOD_HOME/context"
 
-CXPOD_CODEX_BIN="${CXPOD_CODEX_BIN:-/Applications/Codex.app/Contents/Resources/codex}"
+CXPOD_CODEX_APP_BIN="/Applications/Codex.app/Contents/Resources/codex"
+if [[ -z "${CXPOD_CODEX_BIN:-}" ]]; then
+  if command -v codex >/dev/null 2>&1; then
+    CXPOD_CODEX_BIN="$(command -v codex)"
+  else
+    CXPOD_CODEX_BIN="$CXPOD_CODEX_APP_BIN"
+  fi
+fi
 CXPOD_USER_CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 
 # ─── Logging ──────────────────────────────────────────────
@@ -61,6 +68,15 @@ die()  { printf '❌ %s\n' "$*" >&2; exit 1; }
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "需要命令: $1"
+}
+
+require_codex_bin() {
+  [[ -x "$CXPOD_CODEX_BIN" ]] && return 0
+  if [[ "$CXPOD_CODEX_BIN" != */* ]] && command -v "$CXPOD_CODEX_BIN" >/dev/null 2>&1; then
+    CXPOD_CODEX_BIN="$(command -v "$CXPOD_CODEX_BIN")"
+    return 0
+  fi
+  die "找不到 Codex 本体。请安装 Codex CLI（npm i -g @openai/codex）或 Codex.app；也可设置 CXPOD_CODEX_BIN=/path/to/codex。"
 }
 
 # ─── Validation ───────────────────────────────────────────
@@ -127,9 +143,22 @@ cxpod_badge() {
   local name="$1"
   local file emoji display
   file="$(provider_file "$name" 2>/dev/null)" || { printf '⚪ %s' "$name"; return; }
-  if command -v jq >/dev/null 2>&1; then
-    emoji="$(jq -r '.badge_emoji // "⚪"' "$file" 2>/dev/null)"
-    display="$(jq -r '.display_name // .id // empty' "$file" 2>/dev/null)"
+  if command -v python3 >/dev/null 2>&1; then
+    while IFS= read -r line; do
+      case "$line" in
+        emoji=*) emoji="${line#emoji=}" ;;
+        display=*) display="${line#display=}" ;;
+      esac
+    done < <(python3 - "$file" <<'PYEOF' 2>/dev/null || true
+import json, sys
+try:
+    cfg = json.load(open(sys.argv[1]))
+except Exception:
+    cfg = {}
+print("emoji=" + str(cfg.get("badge_emoji") or "⚪"))
+print("display=" + str(cfg.get("display_name") or cfg.get("id") or ""))
+PYEOF
+)
   fi
   : "${emoji:=⚪}"
   : "${display:=$name}"
@@ -431,6 +460,21 @@ if mp.get('requires_openai_auth') and os.environ.get('OPENAI_API_KEY'):
 PYEOF
 }
 
+provider_env_file() {
+  local window_id="$1"
+  is_valid_window_id "$window_id" || die "window id 非法: $window_id"
+  printf '%s/%s/provider.env' "$CXPOD_HOMES_DIR" "$window_id"
+}
+
+write_provider_env_file() {
+  local name="$1" window_id="$2"
+  local file; file="$(provider_env_file "$window_id")"
+  mkdir -p "$(dirname "$file")"
+  provider_env_assignments "$name" | atomic_write "$file"
+  chmod 600 "$file" 2>/dev/null || true
+  printf '%s' "$file"
+}
+
 # ─── State file (per-window) ──────────────────────────────
 # Schema: {"window_id":"cx-1","provider":"openai","model":"gpt-5.5","updated_at":"..."}
 # write_window_state merges into the existing state file so that fields
@@ -441,18 +485,18 @@ write_window_state() {
   is_valid_window_id "$id" || die "window id 非法: $id"
   local ts; ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   local file="$CXPOD_STATE_DIR/$id.json"
-  python3 - "$file" <<PYEOF | atomic_write "$file"
+  python3 - "$file" "$id" "$provider" "$model" "$ts" <<'PYEOF' | atomic_write "$file"
 import json, os, sys
-path = sys.argv[1]
+path, window_id, provider, model, ts = sys.argv[1:6]
 try:
     existing = json.load(open(path)) if os.path.isfile(path) else {}
 except Exception:
     existing = {}
 existing.update({
-    "window_id": "$id",
-    "provider": "$provider",
-    "model": "$model",
-    "updated_at": "$ts",
+    "window_id": window_id,
+    "provider": provider,
+    "model": model,
+    "updated_at": ts,
 })
 print(json.dumps(existing, ensure_ascii=False, indent=2))
 PYEOF

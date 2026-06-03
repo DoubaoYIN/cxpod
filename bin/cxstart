@@ -51,6 +51,7 @@ pick_with_fzf_or_first() {
   if command -v fzf >/dev/null 2>&1; then
     printf '%s\n' "${choices[@]}" | fzf --prompt="$prompt " --height=40% --border
   else
+    info "ℹ️  未检测到 fzf，默认选择 ${choices[0]}；可用 -p 显式指定 provider。"
     printf '%s' "${choices[0]}"
   fi
 }
@@ -123,6 +124,7 @@ while (( $# )); do
 done
 
 ensure_runtime_dirs
+require_codex_bin
 
 case "$MODE" in
   list)  list_sessions; exit 0 ;;
@@ -157,7 +159,9 @@ PROVIDER="$(resolve_provider "$PROVIDER_ARG")"
 
 # Non-tmux emergency mode.
 if [[ "$MODE" == "no-tmux" ]]; then
-  TMP_HOME="$(mktemp -d -t cxpod-notmux-XXXXXX)"
+  TMP_HOME="$(mktemp -d "$CXPOD_HOMES_DIR/notmux.XXXXXX")"
+  cleanup_notmux() { rm -rf "$TMP_HOME"; }
+  trap cleanup_notmux EXIT
   ln -s "$CXPOD_USER_CODEX_HOME/installation_id" "$TMP_HOME/installation_id" 2>/dev/null || true
   PFILE="$(provider_file "$PROVIDER")"
   KIND="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('kind','relay'))" "$PFILE" 2>/dev/null || echo relay)"
@@ -166,7 +170,8 @@ if [[ "$MODE" == "no-tmux" ]]; then
   bash -c "source '$SCRIPT_DIR/lib/common.sh' && render_config_toml '$PROVIDER'" > "$TMP_HOME/config.toml"
   info "🚨 --no-tmux 模式，无 HUD"
   cd "$DIR"
-  exec env CODEX_HOME="$TMP_HOME" "$CXPOD_CODEX_BIN"
+  CODEX_HOME="$TMP_HOME" "$CXPOD_CODEX_BIN"
+  exit $?
 fi
 
 # Require tmux for normal mode.
@@ -188,8 +193,8 @@ write_window_state "$WINDOW_ID" "$PROVIDER" "$MODEL"
 # CODEX_HOME with -C pointing at the project directory.
 # Provider JSON may reference secrets via ${ENV:VAR}. cxpod loads ~/.cxpod/env
 # and injects only referenced env vars into the Codex process.
-ENV_ASSIGNMENTS="$(provider_env_assignments "$PROVIDER" | tr '\n' ' ')"
-_CODEX_INNER="${ENV_ASSIGNMENTS}CODEX_HOME=$(printf '%q' "$WINDOW_HOME") $(printf '%q' "$CXPOD_CODEX_BIN") -C $(printf '%q' "$DIR")"
+PROVIDER_ENV_FILE="$(write_provider_env_file "$PROVIDER" "$WINDOW_ID")"
+_CODEX_INNER="set -a; source $(printf '%q' "$PROVIDER_ENV_FILE") 2>/dev/null || true; set +a; CODEX_HOME=$(printf '%q' "$WINDOW_HOME") $(printf '%q' "$CXPOD_CODEX_BIN") -C $(printf '%q' "$DIR")"
 CODEX_CMD="${SHELL:-/bin/zsh} -lc $(printf '%q' "$_CODEX_INNER")"
 
 # Build the bottom-pane status command. It re-renders every 2s.
@@ -213,11 +218,12 @@ tmux split-window -t "$WINDOW_ID:0" -v -l 1 -d "$STATUS_CMD"
 # send keys there later. Pane index 0 is top (codex) since we split the
 # window after creating the codex pane — the original becomes index 0.
 TMUX_TARGET="$WINDOW_ID:0.0"
-python3 - <<PYEOF | atomic_write "$CXPOD_STATE_DIR/$WINDOW_ID.json"
-import json
-d = json.load(open("$CXPOD_STATE_DIR/$WINDOW_ID.json"))
-d["tmux_target"] = "$TMUX_TARGET"
-d["project_dir"] = "$DIR"
+python3 - "$CXPOD_STATE_DIR/$WINDOW_ID.json" "$TMUX_TARGET" "$DIR" <<'PYEOF' | atomic_write "$CXPOD_STATE_DIR/$WINDOW_ID.json"
+import json, sys
+path, tmux_target, project_dir = sys.argv[1:4]
+d = json.load(open(path))
+d["tmux_target"] = tmux_target
+d["project_dir"] = project_dir
 print(json.dumps(d, ensure_ascii=False, indent=2))
 PYEOF
 

@@ -37,7 +37,21 @@ final class BalanceService {
     private var lastFetchedAt: [String: Date] = [:]
     private var cooldownUntil: [String: Date] = [:]
 
+    func isDisabled() -> Bool {
+        if isTruthy(ProcessInfo.processInfo.environment["CXPOD_DISABLE_BALANCE"]) {
+            return true
+        }
+        if UserDefaults.standard.bool(forKey: "CXPOD_DISABLE_BALANCE") {
+            return true
+        }
+        let envFile = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cxpod/env")
+        return isTruthy(readEnvValue(file: envFile, key: "CXPOD_DISABLE_BALANCE"))
+    }
+
     func fetchBalance(provider: String, force: Bool = false, completion: @escaping (BalanceInfo?) -> Void) {
+        guard !isDisabled() else {
+            completion(cached(provider)); return
+        }
         guard let config = readProviderConfig(provider),
               !config.apiKey.isEmpty else {
             completion(cached(provider)); return
@@ -75,6 +89,9 @@ final class BalanceService {
     }
 
     func refreshKnown(provider: String, completion: @escaping (BalanceInfo?) -> Void) {
+        guard !isDisabled() else {
+            completion(cached(provider)); return
+        }
         guard let config = readProviderConfig(provider),
               !config.apiKey.isEmpty else {
             completion(cached(provider)); return
@@ -179,9 +196,16 @@ final class BalanceService {
             let today = fmt.string(from: Date())
             let start = fmt.string(from: Date(timeIntervalSinceNow: -90 * 86400))
             let usageURL = baseURL.appendingPathComponent("/v1/dashboard/billing/usage")
-            var comps = URLComponents(url: usageURL, resolvingAgainstBaseURL: false)!
+            guard var comps = URLComponents(url: usageURL, resolvingAgainstBaseURL: false) else {
+                self.registerFailure(provider: provider, statusCode: nil, body: "")
+                completion(nil); return
+            }
             comps.queryItems = [.init(name: "start_date", value: start), .init(name: "end_date", value: today)]
-            var req = URLRequest(url: comps.url!)
+            guard let url = comps.url else {
+                self.registerFailure(provider: provider, statusCode: nil, body: "")
+                completion(nil); return
+            }
+            var req = URLRequest(url: url)
             req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
             self.session.dataTask(with: req) { data, resp, _ in
                 let http = resp as? HTTPURLResponse
@@ -246,6 +270,16 @@ final class BalanceService {
             return ProviderConfig(baseURL: url, apiKey: apiKey)
         }
         return nil
+    }
+
+    private func isTruthy(_ value: String?) -> Bool {
+        guard let value else { return false }
+        switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "1", "true", "yes", "on":
+            return true
+        default:
+            return false
+        }
     }
 
     private func readEnvValue(file: URL, key: String) -> String? {

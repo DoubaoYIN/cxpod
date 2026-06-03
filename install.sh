@@ -71,8 +71,25 @@ brew_package_for() {
   esac
 }
 
+codex_binary_available() {
+  command -v codex >/dev/null 2>&1 ||
+    [[ -x "/Applications/Codex.app/Contents/Resources/codex" ]]
+}
+
+print_codex_install_help() {
+  cat >&2 <<'EOF'
+
+请先安装 Codex 本体，二选一：
+  npm i -g @openai/codex
+  或安装 Codex.app
+
+如果 codex 不在默认 PATH，可安装后设置：
+  export CXPOD_CODEX_BIN="$(command -v codex)"
+EOF
+}
+
 check_deps() {
-  local missing=() optional_missing=()
+  local missing=() optional_missing=() codex_missing=0
   for name in tmux python3 bash; do
     if command -v "$name" >/dev/null 2>&1; then
       info "✅ $name ($(command -v "$name"))"
@@ -81,7 +98,17 @@ check_deps() {
       missing+=("$name")
     fi
   done
-  for name in fzf swift; do
+  if codex_binary_available; then
+    if command -v codex >/dev/null 2>&1; then
+      info "✅ codex ($(command -v codex))"
+    else
+      info "✅ codex (/Applications/Codex.app/Contents/Resources/codex)"
+    fi
+  else
+    info "❌ codex 未找到"
+    codex_missing=1
+  fi
+  for name in fzf swift sqlite3; do
     if command -v "$name" >/dev/null 2>&1; then
       info "✅ $name ($(command -v "$name"))"
     else
@@ -91,6 +118,10 @@ check_deps() {
   done
 
   if (( ${#missing[@]} == 0 )); then
+    if (( codex_missing )); then
+      print_codex_install_help
+      exit 1
+    fi
     return 0
   fi
 
@@ -107,6 +138,7 @@ check_deps() {
   echo ""
   echo "请先安装必要依赖："
   echo "  brew install tmux python"
+  (( codex_missing )) && print_codex_install_help
   exit 1
 }
 
@@ -207,7 +239,7 @@ fi
 echo "✅ cxpod 安装完成"
 echo ""
 echo "下一步："
-echo "  1. 先确认 Codex.app / Codex CLI 已登录。"
+echo "  1. 先执行 codex login，或在 Codex.app 内完成登录。"
 echo "  2. 启动会话：cxstart -d ~/my-project -p openai"
 echo "  3. 查看会话：cxnow --list"
 if [[ -n "$CXPOD_INSTALLED_APP_PATH" && -d "$CXPOD_INSTALLED_APP_PATH" ]]; then

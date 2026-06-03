@@ -118,6 +118,7 @@ final class StatusController: NSObject, NSWindowDelegate {
 
     private func startBalanceAutoRefresh() {
         stopBalanceAutoRefresh()
+        guard !BalanceService.shared.isDisabled() else { return }
         balanceAutoRefreshEnabled = true
         DispatchQueue.main.asyncAfter(deadline: .now() + initialBalanceAutoRefreshDelay) { [weak self] in
             guard let self, self.balanceAutoRefreshEnabled else { return }
@@ -202,7 +203,7 @@ final class StatusController: NSObject, NSWindowDelegate {
         let hosting = NSHostingController(rootView: view)
         let window = NSWindow(contentViewController: hosting)
         window.title = "添加线路"; window.styleMask = [.titled, .closable]
-        window.setContentSize(NSSize(width: 340, height: 400)); window.center()
+        window.setContentSize(NSSize(width: 360, height: 440)); window.center()
         window.isReleasedWhenClosed = false
         window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
         addProviderWindow = window
@@ -299,6 +300,7 @@ final class StatusController: NSObject, NSWindowDelegate {
             let p = Process()
             p.executableURL = URL(fileURLWithPath: executable)
             p.arguments = arguments
+            p.environment = cxpodProcessEnvironment()
             p.standardOutput = Pipe(); p.standardError = Pipe()
             do { try p.run(); p.waitUntilExit() }
             catch { DispatchQueue.main.async { self?.showError(error) } }
