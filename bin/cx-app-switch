@@ -76,7 +76,11 @@ NAME="$(resolve_provider "$PROVIDER_ARG")"
 PFILE="$(provider_file "$NAME")"
 KIND="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('kind','relay'))" "$PFILE" 2>/dev/null || echo relay)"
 APP_SWITCH_BACKUP_ROOT=""
-CXPOD_CODEX_APP_PROCESS_PATTERN='^/Applications/Codex\.app/'
+# 检测/安全门用：宽匹配，宁可多报不漏报（必须确认 app-server 等子进程全部退出，
+# 漏检会让旧 auth 留在内存里导致静默切换失败）。
+CXPOD_CODEX_APP_DETECT_PATTERN='/Applications/Codex\.app/'
+# 击杀用：精确锚定，避免误伤命令行里恰好包含该路径的无关进程。
+CXPOD_CODEX_APP_KILL_PATTERN='^/Applications/Codex\.app/'
 
 prepare_app_switch_backup() {
   [[ -n "$APP_SWITCH_BACKUP_ROOT" ]] && return 0
@@ -136,7 +140,7 @@ codex_main_running() {
   pgrep -fq "^/Applications/Codex\.app/Contents/MacOS/Codex" 2>/dev/null
 }
 codex_any_running() {
-  pgrep -fq "$CXPOD_CODEX_APP_PROCESS_PATTERN" 2>/dev/null
+  pgrep -fq "$CXPOD_CODEX_APP_DETECT_PATTERN" 2>/dev/null
 }
 
 signal_codex_pids() {
@@ -146,7 +150,7 @@ signal_codex_pids() {
   # The key target here is `codex app-server`, which caches auth.json in
   # memory — leaving it alive defeats the entire provider switch.
   local sig="$1" pids
-  pids="$(pgrep -f "$CXPOD_CODEX_APP_PROCESS_PATTERN" 2>/dev/null || true)"
+  pids="$(pgrep -f "$CXPOD_CODEX_APP_KILL_PATTERN" 2>/dev/null || true)"
   if [[ -n "$pids" ]]; then
     # shellcheck disable=SC2086
     kill -"$sig" $pids 2>/dev/null || true
@@ -204,7 +208,7 @@ if codex_any_running; then
     # in memory and `open -a Codex` just foregrounds the existing app
     # instead of restarting it — exactly the bug this phase prevents.
     if codex_any_running; then
-      survivors="$(pgrep -fl "$CXPOD_CODEX_APP_PROCESS_PATTERN" 2>/dev/null || true)"
+      survivors="$(pgrep -fl "$CXPOD_CODEX_APP_DETECT_PATTERN" 2>/dev/null || true)"
       die "无法终止 Codex.app 进程，请手动 Cmd+Q 后重试。存活进程:
 $survivors"
     fi
