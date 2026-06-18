@@ -40,6 +40,7 @@ cxpod 做的事情很简单：
 
 - `cxstart`：启动一个 cxpod 管理的 Codex 会话。
 - `cxuse`：在当前会话里切换 provider。
+- `cxauth`：管理多个官方 GPT/OpenAI 登录账号。
 - `cxnow`：查看当前和正在运行的会话。
 - `cx-status`：底部状态栏，显示 provider、model、上下文使用率。
 - `cx-app-switch`：切换 Codex.app GUI 使用的 provider。
@@ -82,7 +83,7 @@ curl -fsSL https://raw.githubusercontent.com/DoubaoYIN/cxpod/main/install.sh | b
 安装脚本会做这些事：
 
 - 下载或更新 cxpod 到 `~/Projects/cxpod`
-- 安装命令：`cxstart`、`cxuse`、`cxnow`、`cx-status`、`cx-app-switch`
+- 安装命令：`cxstart`、`cxuse`、`cxauth`、`cxnow`、`cx-status`、`cx-app-switch`
 - 创建本地私有目录：`~/.cxpod/`
 - 复制一个 relay 配置模板到 `~/.cxpod/providers/`
 - 如果本机有 Swift toolchain，构建并安装 `CxPod.app`
@@ -130,6 +131,33 @@ cxnow --list              # 查看正在运行的 cxpod 会话
 cxstart --attach cx-1     # 回到 cx-1 会话
 cxstart --kill cx-1       # 关闭并清理 cx-1
 ```
+
+## 多个 GPT / OpenAI 官方账号
+
+官方 `openai` provider 走 Codex 的 ChatGPT/OAuth 登录态。多个 GPT 账号用 `cxauth` 管理，不需要 API key：
+
+```bash
+cxauth login personal     # 打开 Codex 登录流程，保存为 personal
+cxauth login work         # 再登录另一个 GPT 账号，保存为 work
+cxauth --list             # 查看已保存账号
+cxauth use personal       # 设为 cxpod 默认账号
+```
+
+也可以先在 Codex.app 或 `codex login` 里完成登录，再保存当前登录态：
+
+```bash
+cxauth save work
+```
+
+启动或切换官方账号：
+
+```bash
+cxstart -d ~/my-project -p openai --account work
+cxuse openai --account personal
+cx-app-switch openai --account work
+```
+
+菜单栏 app 也会在 `openai` 线路下显示账号选择；relay/API provider 仍按原来的 API key 方式使用。
 
 如果菜单栏 app 已安装，可以打开：
 
@@ -254,6 +282,12 @@ cxpod 会做这些事：
 cxuse --global my-relay
 ```
 
+官方账号也可以这样全局切换：
+
+```bash
+cxuse --global openai --account work
+```
+
 ## 安装脚本选项
 
 普通用户一般不需要设置这些。需要自定义时，可以在命令前加环境变量：
@@ -313,6 +347,7 @@ flowchart TD
 | `~/Projects/cxpod/` | 这个开源仓库本体。 |
 | `~/.cxpod/providers/` | 用户自己的 provider 配置。真实 provider 放这里，不提交到 Git。 |
 | `~/.cxpod/env` | 用户自己的 API key。权限会尽量收紧到 `600`。 |
+| `~/.cxpod/codex-auth/accounts/` | 多个官方 GPT 账号的 Codex OAuth 登录态。 |
 | `~/.cxpod/codex-homes/cx-N/` | 每个 cxpod window 独立的 Codex 配置和会话目录。 |
 | `~/.cxpod/state/` | cxpod 记录 window、provider、项目目录等状态。 |
 | `~/.codex/` | Codex.app / Codex CLI 原本的用户目录。cxpod 会尽量谨慎读取或备份后改写。 |
@@ -357,9 +392,9 @@ Codex 会从 `CODEX_HOME` 读取配置。cxpod 每启动一个窗口，就创建
 
 所以你可以同时运行：
 
-- `cx-1` 使用 OpenAI 官方
+- `cx-1` 使用 OpenAI 官方 / personal 账号
 - `cx-2` 使用公司 relay
-- `cx-3` 使用另一个第三方 provider
+- `cx-3` 使用 OpenAI 官方 / work 账号或另一个第三方 provider
 
 它们互不覆盖配置。
 
@@ -392,6 +427,7 @@ cxuse
 - 仓库不内置任何第三方中转站密钥或内部 URL。
 - 真实 provider 配置默认放在 `~/.cxpod/providers/`，不进入 Git。
 - 真实 key 推荐放在 `~/.cxpod/env`，并设置为 `600` 权限。
+- 官方 GPT 账号登录态保存在 `~/.cxpod/codex-auth/accounts/`，并设置为 `600` 权限。
 - relay key 会写入当前 window 专属的 `provider.env`，再由 shell 在本地 source，避免明文 key 出现在 tmux 启动命令行。
 - 渲染 Codex `config.toml` 时跳过 `api_key`、`env_key` 等 cxpod 元数据，避免把 key 展开到额外配置文件。
 - 菜单栏 app 会用本机 `~/.cxpod/env` 中的 key 向你配置的 provider `base_url` 查询余额，默认启动后延迟 5 分钟、之后每小时刷新一次；请求只从本机发往该 provider，不经过 cxpod 作者或其他服务器。要关闭它，在 `~/.cxpod/env` 加入：`CXPOD_DISABLE_BALANCE=1`。

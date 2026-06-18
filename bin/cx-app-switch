@@ -6,6 +6,7 @@
 #
 # 用法:
 #   cx-app-switch <provider>            切换并重启 Codex.app
+#   cx-app-switch openai --account work 切换官方 provider + GPT 账号
 #   cx-app-switch --no-restart <p>      仅改配置和元数据，不重启
 #   cx-app-switch --no-rewrite <p>      不改写历史 rollout 的 provider 标签
 #   cx-app-switch --list                列出可用 provider
@@ -35,6 +36,7 @@ cx-app-switch — 切换 Codex.app（GUI）provider 并重启
 
 USAGE
   cx-app-switch <provider>          切换并重启 Codex.app
+  cx-app-switch openai --account work
   cx-app-switch --no-restart <p>    仅改配置和元数据，不重启
   cx-app-switch --no-rewrite <p>    不改写历史 rollout 元数据
   cx-app-switch --list, -l          列出可用 provider
@@ -45,6 +47,7 @@ EOF
 NO_RESTART=0
 NO_REWRITE=0
 PROVIDER_ARG=""
+AUTH_PROFILE_ARG=""
 
 while (( $# )); do
   case "$1" in
@@ -52,6 +55,9 @@ while (( $# )); do
     -l|--list) ensure_runtime_dirs; list_providers; exit 0 ;;
     --no-restart) NO_RESTART=1; shift ;;
     --no-rewrite) NO_REWRITE=1; shift ;;
+    -a|--account)
+      [[ $# -ge 2 ]] || die "--account 需要参数"
+      AUTH_PROFILE_ARG="$2"; shift 2 ;;
     --) shift; break ;;
     -*) die "未知选项: $1" ;;
     *)
@@ -75,6 +81,12 @@ require_cmd python3
 NAME="$(resolve_provider "$PROVIDER_ARG")"
 PFILE="$(provider_file "$NAME")"
 KIND="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('kind','relay'))" "$PFILE" 2>/dev/null || echo relay)"
+AUTH_PROFILE=""
+if [[ "$KIND" == "official" ]]; then
+  AUTH_PROFILE="$(select_auth_profile "$AUTH_PROFILE_ARG")"
+else
+  [[ -z "$AUTH_PROFILE_ARG" ]] || warn "--account 仅对 official provider 生效，已忽略"
+fi
 APP_SWITCH_BACKUP_ROOT=""
 # 检测/安全门用：宽匹配，宁可多报不漏报（必须确认 app-server 等子进程全部退出，
 # 漏检会让旧 auth 留在内存里导致静默切换失败）。
@@ -215,9 +227,10 @@ $survivors"
   fi
 fi
 
-sync_oauth_authority_from_codex_home "$CXPOD_USER_CODEX_HOME"
+OLD_AUTH_PROFILE="$(current_codex_app_auth_profile 2>/dev/null || current_auth_profile 2>/dev/null || true)"
+[[ -n "$OLD_AUTH_PROFILE" ]] && sync_oauth_authority_from_codex_home "$CXPOD_USER_CODEX_HOME" "$OLD_AUTH_PROFILE"
 backup_app_switch_state
-sync_auth_json "$CXPOD_USER_CODEX_HOME" "$KIND" "$NAME"
+sync_auth_json "$CXPOD_USER_CODEX_HOME" "$KIND" "$NAME" "$AUTH_PROFILE"
 
 # Patch config.toml synchronously before relaunching. This keeps the app's
 # provider, auth.json, sqlite thread index, and rollout metadata in one state.
@@ -457,8 +470,14 @@ fi
 
 printf '%s' "$NAME" | atomic_write "$CXPOD_CURRENT_FILE"
 cxpod_badge "$NAME" | atomic_write "$CXPOD_STATUS_FILE"
+if [[ -n "$AUTH_PROFILE" ]]; then
+  set_current_auth_profile "$AUTH_PROFILE"
+  set_current_codex_app_auth_profile "$AUTH_PROFILE"
+fi
 
-info "✅ Codex.app provider 已切换为: $(cxpod_badge "$NAME")"
+PROVIDER_LABEL="$(cxpod_badge "$NAME")"
+[[ -n "$AUTH_PROFILE" ]] && PROVIDER_LABEL="$PROVIDER_LABEL/$AUTH_PROFILE"
+info "✅ Codex.app provider 已切换为: $PROVIDER_LABEL"
 
 # Optional compatibility path for relay setups that still require GUI-wide
 # launchd env vars. It is disabled by default because those values are visible

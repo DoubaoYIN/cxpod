@@ -32,9 +32,10 @@ EOF
 }
 
 format_status_line() {
-  local id="$1" provider="$2" model="$3"
+  local id="$1" provider="$2" model="$3" auth_profile="${4:-}"
   local user; user="${USER:-$(whoami)}"
   local badge; badge="$(cxpod_badge "$provider")"
+  [[ -n "$auth_profile" ]] && badge="$badge/$auth_profile"
   local model_part="${model:-?}"
   printf '#%s [%s|%s] | %s' "$id" "$model_part" "$badge" "$user"
 }
@@ -44,11 +45,12 @@ cmd_list() {
   local found=0
   for f in "$CXPOD_STATE_DIR"/cx-*.json; do
     [[ -f "$f" ]] || continue
-    local id provider model
+    local id provider model auth_profile
     id="$(basename "$f" .json)"
     provider="$(read_window_state_field "$id" provider || echo "?")"
     model="$(read_window_state_field "$id" model || echo "")"
-    printf '%s\n' "$(format_status_line "$id" "$provider" "$model")"
+    auth_profile="$(read_window_state_field "$id" auth_profile || echo "")"
+    printf '%s\n' "$(format_status_line "$id" "$provider" "$model" "$auth_profile")"
     found=1
   done
   if (( found == 0 )); then
@@ -79,6 +81,7 @@ if [[ -n "$WINDOW_ID" ]]; then
   is_valid_window_id "$WINDOW_ID" || die "window id 非法: $WINDOW_ID"
   PROVIDER="$(read_window_state_field "$WINDOW_ID" provider 2>/dev/null || true)"
   MODEL="$(read_window_state_field "$WINDOW_ID" model 2>/dev/null || true)"
+  AUTH_PROFILE="$(read_window_state_field "$WINDOW_ID" auth_profile 2>/dev/null || true)"
   if [[ -z "$PROVIDER" ]]; then
     [[ "$MODE" == "plain" ]] && exit 1
     echo "(window $WINDOW_ID 无状态文件)"
@@ -88,16 +91,21 @@ else
   [[ -f "$CXPOD_CURRENT_FILE" ]] || { echo "(no provider set)"; exit 1; }
   PROVIDER="$(cat "$CXPOD_CURRENT_FILE")"
   MODEL=""
+  AUTH_PROFILE=""
 fi
 
 case "$MODE" in
   plain) printf '%s\n' "$PROVIDER" ;;
-  badge) printf '%s\n' "$(cxpod_badge "$PROVIDER")" ;;
+  badge)
+    BADGE="$(cxpod_badge "$PROVIDER")"
+    [[ -n "${AUTH_PROFILE:-}" ]] && BADGE="$BADGE/$AUTH_PROFILE"
+    printf '%s\n' "$BADGE"
+    ;;
   line)
     if [[ -z "$WINDOW_ID" ]]; then
       printf '[%s] | %s\n' "$(cxpod_badge "$PROVIDER")" "${USER:-$(whoami)}"
     else
-      printf '%s\n' "$(format_status_line "$WINDOW_ID" "$PROVIDER" "$MODEL")"
+      printf '%s\n' "$(format_status_line "$WINDOW_ID" "$PROVIDER" "$MODEL" "$AUTH_PROFILE")"
     fi
     ;;
 esac

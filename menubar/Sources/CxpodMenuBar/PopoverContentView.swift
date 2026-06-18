@@ -10,20 +10,27 @@ final class PopoverViewModel: ObservableObject {
     @Published var selectedTerminal: String = ""
     @Published var balances: [String: BalanceInfo] = [:]
     @Published var codexAppProviders: [String] = []
+    @Published var authProfiles: [String] = []
+    @Published var officialProviders: [String] = []
+    @Published var selectedAuthProfile: String = ""
     @Published var currentCodexAppProvider: String = ""
     @Published var selectedCodexAppProvider: String = ""
+    @Published var currentCodexAppAuthProfile: String = ""
+    @Published var selectedCodexAppAuthProfile: String = ""
 
-    var onLaunch: ((String, String, String) -> Void)?
-    var onSwitch: ((SessionInfo, String) -> Void)?
+    var onLaunch: ((String, String, String, String?) -> Void)?
+    var onSwitch: ((SessionInfo, String, String?) -> Void)?
     var onClose: ((SessionInfo) -> Void)?
     var onQuit: (() -> Void)?
     var onShowAddProvider: (() -> Void)?
     var onAddProject: (() -> Void)?
-    var onCodexAppSwitch: ((String) -> Void)?
+    var onCodexAppSwitch: ((String, String?) -> Void)?
     var onShowCodexSessionOrganizer: (() -> Void)?
 
-    func refresh(providerManager: ProviderManager, projectManager: ProjectManager, sessionManager: SessionManager, refreshRemote: Bool = false) {
+    func refresh(providerManager: ProviderManager, authProfileManager: AuthProfileManager, projectManager: ProjectManager, sessionManager: SessionManager, refreshRemote: Bool = false) {
         providers = providerManager.availableProviders()
+        officialProviders = providerManager.officialProviderIDs()
+        authProfiles = authProfileManager.availableProfiles()
         projects = projectManager.recentProjects()
         terminals = TerminalRegistry.shared.adapters.map { $0.name }
         sessions = sessionManager.sessions
@@ -35,6 +42,9 @@ final class PopoverViewModel: ObservableObject {
         }
         if selectedTerminal.isEmpty || !terminals.contains(selectedTerminal) {
             selectedTerminal = terminals.first ?? ""
+        }
+        if selectedAuthProfile.isEmpty || !authProfiles.contains(selectedAuthProfile) {
+            selectedAuthProfile = authProfileManager.currentProfile() ?? authProfiles.first ?? ""
         }
         // Codex.app provider list = cxpod providers ∪ already-installed in
         // ~/.codex/config.toml ∪ current value (in case it's none of the above).
@@ -50,10 +60,18 @@ final class PopoverViewModel: ObservableObject {
         if selectedCodexAppProvider.isEmpty || !combined.contains(selectedCodexAppProvider) {
             selectedCodexAppProvider = current.isEmpty ? (combined.first ?? "") : current
         }
+        currentCodexAppAuthProfile = authProfileManager.currentCodexAppProfile() ?? ""
+        if selectedCodexAppAuthProfile.isEmpty || !authProfiles.contains(selectedCodexAppAuthProfile) {
+            selectedCodexAppAuthProfile = currentCodexAppAuthProfile.isEmpty ? (authProfiles.first ?? "") : currentCodexAppAuthProfile
+        }
         loadCachedBalances()
         if refreshRemote {
             refreshBalances(force: true)
         }
+    }
+
+    func isOfficialProvider(_ provider: String) -> Bool {
+        officialProviders.contains(provider)
     }
 
     func loadCachedBalances() {
@@ -126,6 +144,18 @@ struct PopoverContentView: View {
                 Button(action: { vm.onShowAddProvider?() }) { Image(systemName: "plus.circle") }
                     .buttonStyle(.plain).help("添加线路")
             }
+            if vm.isOfficialProvider(vm.selectedProvider) {
+                HStack {
+                    Text("账号").frame(width: 36, alignment: .trailing)
+                    Picker("", selection: $vm.selectedAuthProfile) {
+                        if vm.authProfiles.isEmpty {
+                            Text("default").tag("")
+                        } else {
+                            ForEach(vm.authProfiles, id: \.self) { profile in Text(profile).tag(profile) }
+                        }
+                    }.labelsHidden()
+                }
+            }
             HStack {
                 Text("项目").frame(width: 36, alignment: .trailing)
                 Picker("", selection: $vm.selectedProject) {
@@ -142,7 +172,10 @@ struct PopoverContentView: View {
             }
             HStack {
                 Spacer()
-                Button("启动") { vm.onLaunch?(vm.selectedProvider, vm.selectedProject, vm.selectedTerminal) }
+                Button("启动") {
+                    let account = vm.isOfficialProvider(vm.selectedProvider) ? vm.selectedAuthProfile : nil
+                    vm.onLaunch?(vm.selectedProvider, vm.selectedProject, vm.selectedTerminal, account)
+                }
                     .buttonStyle(.borderedProminent).controlSize(.regular)
                 Spacer()
             }.padding(.top, 2)
@@ -155,7 +188,7 @@ struct PopoverContentView: View {
                 Text("Codex.app").font(.system(size: 12, weight: .medium)).foregroundColor(.secondary)
                 Spacer()
                 if !vm.currentCodexAppProvider.isEmpty {
-                    Text("当前: \(vm.currentCodexAppProvider)")
+                    Text("当前: \(codexAppCurrentLabel)")
                         .font(.system(size: 11)).foregroundColor(.secondary.opacity(0.8))
                 }
             }
@@ -167,6 +200,18 @@ struct PopoverContentView: View {
                 Button(action: { vm.onShowAddProvider?() }) { Image(systemName: "plus.circle") }
                     .buttonStyle(.plain).help("添加线路")
             }
+            if vm.isOfficialProvider(vm.selectedCodexAppProvider) {
+                HStack {
+                    Text("账号").frame(width: 36, alignment: .trailing)
+                    Picker("", selection: $vm.selectedCodexAppAuthProfile) {
+                        if vm.authProfiles.isEmpty {
+                            Text("default").tag("")
+                        } else {
+                            ForEach(vm.authProfiles, id: \.self) { profile in Text(profile).tag(profile) }
+                        }
+                    }.labelsHidden()
+                }
+            }
             HStack {
                 Spacer()
                 Button("整理会话") {
@@ -175,11 +220,11 @@ struct PopoverContentView: View {
                 .controlSize(.regular)
                 Button("切换并重启 Codex.app") {
                     let target = vm.selectedCodexAppProvider
-                    if !target.isEmpty { vm.onCodexAppSwitch?(target) }
+                    let account = vm.isOfficialProvider(target) ? vm.selectedCodexAppAuthProfile : nil
+                    if !target.isEmpty { vm.onCodexAppSwitch?(target, account) }
                 }
                 .buttonStyle(.borderedProminent).controlSize(.regular)
-                .disabled(vm.selectedCodexAppProvider.isEmpty
-                          || vm.selectedCodexAppProvider == vm.currentCodexAppProvider)
+                .disabled(codexAppSwitchDisabled)
                 Spacer()
             }.padding(.top, 2)
         }.font(.system(size: 13))
@@ -196,10 +241,22 @@ struct PopoverContentView: View {
                     Spacer()
                     Menu {
                         ForEach(vm.providers, id: \.self) { p in
-                            Button("切换到 \(p)") { if p != session.provider { vm.onSwitch?(session, p) } }
+                            if vm.isOfficialProvider(p), !vm.authProfiles.isEmpty {
+                                Menu("切换到 \(p)") {
+                                    ForEach(vm.authProfiles, id: \.self) { profile in
+                                        Button(profile) {
+                                            if p != session.provider || profile != session.authProfile {
+                                                vm.onSwitch?(session, p, profile)
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                Button("切换到 \(p)") { if p != session.provider { vm.onSwitch?(session, p, nil) } }
+                            }
                         }
                     } label: {
-                        Text(session.provider).font(.system(size: 12, weight: .medium)).foregroundColor(.secondary)
+                        Text(sessionProviderLabel(session)).font(.system(size: 12, weight: .medium)).foregroundColor(.secondary)
                             .padding(.horizontal, 6).padding(.vertical, 2)
                             .background(Color.primary.opacity(0.06)).clipShape(Capsule())
                     }.menuStyle(.borderlessButton).fixedSize()
@@ -223,6 +280,28 @@ struct PopoverContentView: View {
                 .buttonStyle(.plain)
             Spacer()
         }
+    }
+
+    private var codexAppCurrentLabel: String {
+        guard vm.isOfficialProvider(vm.currentCodexAppProvider),
+              !vm.currentCodexAppAuthProfile.isEmpty else {
+            return vm.currentCodexAppProvider
+        }
+        return "\(vm.currentCodexAppProvider)/\(vm.currentCodexAppAuthProfile)"
+    }
+
+    private var codexAppSwitchDisabled: Bool {
+        guard !vm.selectedCodexAppProvider.isEmpty else { return true }
+        guard vm.selectedCodexAppProvider == vm.currentCodexAppProvider else { return false }
+        guard vm.isOfficialProvider(vm.selectedCodexAppProvider) else { return true }
+        return vm.selectedCodexAppAuthProfile == vm.currentCodexAppAuthProfile
+    }
+
+    private func sessionProviderLabel(_ session: SessionInfo) -> String {
+        guard vm.isOfficialProvider(session.provider), !session.authProfile.isEmpty else {
+            return session.provider
+        }
+        return "\(session.provider)/\(session.authProfile)"
     }
 
     private func providerColor(_ provider: String) -> Color {

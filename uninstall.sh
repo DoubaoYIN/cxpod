@@ -9,7 +9,7 @@ REPO="$(cd "$(dirname "$0")" && pwd)"
 PURGE=0
 [[ "${1:-}" == "--purge" ]] && PURGE=1
 
-CMDS=(cxstart cxuse cxnow cx-status cx-app-switch)
+CMDS=(cxstart cxuse cxauth cxnow cx-status cx-app-switch)
 SEARCH_DIRS=(
   "${CXPOD_BIN_DIR:-}"
   "$HOME/.local/bin"

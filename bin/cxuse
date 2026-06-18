@@ -23,6 +23,7 @@ cxuse — 切换当前 cxpod window 的 Codex provider
 
 USAGE
   cxuse <provider>           切换到指定 provider（前缀匹配）
+  cxuse openai --account work
   cxuse <provider> --cold    冷切换：仅写配置，不重启 codex
   cxuse --window <id> <p>    指定 window id（默认读 $CXPOD_WINDOW_ID）
   cxuse --global <provider>  显式切换真实 ~/.codex/config.toml
@@ -63,6 +64,7 @@ list_providers_pretty() {
 COLD=0
 WINDOW_ID="${CXPOD_WINDOW_ID:-}"
 PROVIDER_ARG=""
+AUTH_PROFILE_ARG=""
 GLOBAL=0
 
 while (( $# )); do
@@ -70,6 +72,9 @@ while (( $# )); do
     -h|--help) usage; exit 0 ;;
     -l|--list) ensure_runtime_dirs; list_providers_pretty; exit 0 ;;
     --cold) COLD=1; shift ;;
+    -a|--account)
+      [[ $# -ge 2 ]] || die "--account 需要参数"
+      AUTH_PROFILE_ARG="$2"; shift 2 ;;
     --global) GLOBAL=1; WINDOW_ID=""; shift ;;
     --window)
       [[ $# -ge 2 ]] || die "--window 需要参数"
@@ -104,11 +109,17 @@ PYEOF
 }
 MODEL="$(read_json_field default_model "")"
 KIND="$(read_json_field kind relay)"
+AUTH_PROFILE=""
+if [[ "$KIND" == "official" ]]; then
+  AUTH_PROFILE="$(select_auth_profile "$AUTH_PROFILE_ARG")"
+else
+  [[ -z "$AUTH_PROFILE_ARG" ]] || warn "--account 仅对 official provider 生效，已忽略"
+fi
 
 # Determine target CODEX_HOME and mode.
 if [[ -n "$WINDOW_ID" ]]; then
   is_valid_window_id "$WINDOW_ID" || die "window id 非法: $WINDOW_ID (期望 cx-N)"
-  TARGET_HOME="$(seed_window_codex_home "$WINDOW_ID" "$KIND" "$NAME")"
+  TARGET_HOME="$(seed_window_codex_home "$WINDOW_ID" "$KIND" "$NAME" "$AUTH_PROFILE")"
   MODE="window"
 else
   if (( ! GLOBAL )); then
@@ -117,8 +128,9 @@ else
   fi
   warn "进入全局模式（直接写 $CXPOD_USER_CODEX_HOME/config.toml）"
   TARGET_HOME="$CXPOD_USER_CODEX_HOME"
-  sync_oauth_authority_from_codex_home "$TARGET_HOME"
-  sync_auth_json "$TARGET_HOME" "$KIND" "$NAME"
+  OLD_AUTH_PROFILE="$(current_codex_app_auth_profile 2>/dev/null || current_auth_profile 2>/dev/null || true)"
+  [[ -n "$OLD_AUTH_PROFILE" ]] && sync_oauth_authority_from_codex_home "$TARGET_HOME" "$OLD_AUTH_PROFILE"
+  sync_auth_json "$TARGET_HOME" "$KIND" "$NAME" "$AUTH_PROFILE"
   MODE="global"
 fi
 
@@ -140,12 +152,18 @@ printf '%s\n' "$TOML_BODY" | atomic_write "$TARGET_HOME/config.toml"
 
 # Update window state + global default file.
 if [[ "$MODE" == "window" ]]; then
-  write_window_state "$WINDOW_ID" "$NAME" "$MODEL"
+  write_window_state "$WINDOW_ID" "$NAME" "$MODEL" "$AUTH_PROFILE"
 fi
 printf '%s' "$NAME" | atomic_write "$CXPOD_CURRENT_FILE"
 cxpod_badge "$NAME" | atomic_write "$CXPOD_STATUS_FILE"
+if [[ -n "$AUTH_PROFILE" ]]; then
+  set_current_auth_profile "$AUTH_PROFILE"
+  [[ "$MODE" == "global" ]] && set_current_codex_app_auth_profile "$AUTH_PROFILE"
+fi
 
-info "✅ provider 已切换为: $(cxpod_badge "$NAME")"
+PROVIDER_LABEL="$(cxpod_badge "$NAME")"
+[[ -n "$AUTH_PROFILE" ]] && PROVIDER_LABEL="$PROVIDER_LABEL/$AUTH_PROFILE"
+info "✅ provider 已切换为: $PROVIDER_LABEL"
 [[ "$MODE" == "window" ]] && info "   window: $WINDOW_ID"
 info "   config: $TARGET_HOME/config.toml"
 

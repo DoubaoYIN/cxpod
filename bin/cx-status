@@ -115,13 +115,15 @@ render_bar() {
 }
 
 render_line() {
-  local provider model
+  local provider model auth_profile
   provider="$(read_window_state_field "$WINDOW_ID" provider 2>/dev/null || echo "?")"
   model="$(read_window_state_field "$WINDOW_ID" model 2>/dev/null || echo "?")"
+  auth_profile="$(read_window_state_field "$WINDOW_ID" auth_profile 2>/dev/null || echo "")"
   [[ -z "$provider" ]] && provider="?"
   [[ -z "$model" ]] && model="?"
 
   local badge; badge="$(cxpod_badge "$provider" 2>/dev/null || printf '%s' "$provider")"
+  [[ -n "$auth_profile" ]] && badge="$badge/$auth_profile"
   local user="${USER:-$(whoami)}"
 
   local ctx_part="Context ░░░░░░░░░░ --%"

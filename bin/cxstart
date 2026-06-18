@@ -5,6 +5,7 @@
 # Usage:
 #   cxstart                                  # interactive: pick dir + provider
 #   cxstart -d <dir> -p <provider>           # non-interactive
+#   cxstart -d <dir> -p openai --account work
 #   cxstart --no-tmux                        # emergency bypass (no HUD)
 #   cxstart --attach <cx-N>                  # reattach existing session
 
@@ -41,6 +42,7 @@ USAGE
 OPTIONS
   -d, --dir <path>        工作目录，默认当前目录
   -p, --provider <name>   provider 名（支持前缀匹配）
+  -a, --account <name>    官方 OpenAI/GPT 账号（仅 official provider）
 EOF
 }
 
@@ -72,11 +74,12 @@ list_sessions() {
     return
   fi
 
-  printf '%-8s  %-10s  %-20s  %-8s  %s\n' "ID" "PROVIDER" "MODEL" "CONTEXT" "PROJECT"
-  printf '%-8s  %-10s  %-20s  %-8s  %s\n' "──" "────────" "─────" "───────" "───────"
-  local id provider model project_dir ctx_pct sfile
+  printf '%-8s  %-16s  %-20s  %-8s  %s\n' "ID" "PROVIDER" "MODEL" "CONTEXT" "PROJECT"
+  printf '%-8s  %-16s  %-20s  %-8s  %s\n' "──" "────────" "─────" "───────" "───────"
+  local id provider auth_profile model project_dir ctx_pct sfile
   for id in "${ids[@]}"; do
     provider="$(read_window_state_field "$id" provider 2>/dev/null || echo "?")"
+    auth_profile="$(read_window_state_field "$id" auth_profile 2>/dev/null || echo "")"
     model="$(read_window_state_field "$id" model 2>/dev/null || echo "?")"
     project_dir="$(read_window_state_field "$id" project_dir 2>/dev/null || echo "")"
     [[ -n "$project_dir" ]] && project_dir="${project_dir/#$HOME/\~}"
@@ -88,7 +91,8 @@ list_sessions() {
       [[ -n "$tok" ]] && ctx_pct="$tok"
     fi
     local badge; badge="$(cxpod_badge "$provider" 2>/dev/null || echo "$provider")"
-    printf '%-8s  %-10s  %-20s  %-8s  %s\n' "$id" "$badge" "$model" "$ctx_pct" "$project_dir"
+    [[ -n "$auth_profile" ]] && badge="$badge/$auth_profile"
+    printf '%-8s  %-16s  %-20s  %-8s  %s\n' "$id" "$badge" "$model" "$ctx_pct" "$project_dir"
   done
 }
 
@@ -106,6 +110,7 @@ kill_session() {
 # Parse args.
 DIR=""
 PROVIDER_ARG=""
+AUTH_PROFILE_ARG=""
 MODE="normal"
 ATTACH_ID=""
 KILL_ID=""
@@ -115,6 +120,7 @@ while (( $# )); do
     -h|--help) usage; exit 0 ;;
     -d|--dir) DIR="$2"; shift 2 ;;
     -p|--provider) PROVIDER_ARG="$2"; shift 2 ;;
+    -a|--account) AUTH_PROFILE_ARG="$2"; shift 2 ;;
     --no-tmux) MODE="no-tmux"; shift ;;
     --attach) ATTACH_ID="$2"; MODE="attach"; shift 2 ;;
     --kill)   KILL_ID="$2";   MODE="kill";   shift 2 ;;
@@ -165,7 +171,15 @@ if [[ "$MODE" == "no-tmux" ]]; then
   ln -s "$CXPOD_USER_CODEX_HOME/installation_id" "$TMP_HOME/installation_id" 2>/dev/null || true
   PFILE="$(provider_file "$PROVIDER")"
   KIND="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('kind','relay'))" "$PFILE" 2>/dev/null || echo relay)"
-  sync_auth_json "$TMP_HOME" "$KIND" "$PROVIDER"
+  AUTH_PROFILE=""
+  if [[ "$KIND" == "official" ]]; then
+    AUTH_PROFILE="$(select_auth_profile "$AUTH_PROFILE_ARG")"
+    sync_auth_json "$TMP_HOME" "$KIND" "$PROVIDER" "$AUTH_PROFILE"
+    set_current_auth_profile "$AUTH_PROFILE"
+  else
+    [[ -z "$AUTH_PROFILE_ARG" ]] || warn "--account 仅对 official provider 生效，已忽略"
+    sync_auth_json "$TMP_HOME" "$KIND" "$PROVIDER"
+  fi
   # Write config directly into tmp home (since --window mode expects cx-N)
   bash -c "source '$SCRIPT_DIR/lib/common.sh' && render_config_toml '$PROVIDER'" > "$TMP_HOME/config.toml"
   info "🚨 --no-tmux 模式，无 HUD"
@@ -184,10 +198,17 @@ info "🆕 window id: $WINDOW_ID"
 # Prepare the window's CODEX_HOME (symlinks auth etc.) and write config.
 PFILE="$(provider_file "$PROVIDER")"
 KIND="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('kind','relay'))" "$PFILE" 2>/dev/null || echo relay)"
-WINDOW_HOME="$(seed_window_codex_home "$WINDOW_ID" "$KIND" "$PROVIDER")"
+AUTH_PROFILE=""
+if [[ "$KIND" == "official" ]]; then
+  AUTH_PROFILE="$(select_auth_profile "$AUTH_PROFILE_ARG")"
+else
+  [[ -z "$AUTH_PROFILE_ARG" ]] || warn "--account 仅对 official provider 生效，已忽略"
+fi
+WINDOW_HOME="$(seed_window_codex_home "$WINDOW_ID" "$KIND" "$PROVIDER" "$AUTH_PROFILE")"
+[[ -n "$AUTH_PROFILE" ]] && set_current_auth_profile "$AUTH_PROFILE"
 MODEL="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('default_model',''))" "$PFILE" 2>/dev/null || true)"
 render_config_toml "$PROVIDER" | atomic_write "$WINDOW_HOME/config.toml"
-write_window_state "$WINDOW_ID" "$PROVIDER" "$MODEL"
+write_window_state "$WINDOW_ID" "$PROVIDER" "$MODEL" "$AUTH_PROFILE"
 
 # Build the top-pane codex command. We run codex inside the window's
 # CODEX_HOME with -C pointing at the project directory.
@@ -227,5 +248,7 @@ d["project_dir"] = project_dir
 print(json.dumps(d, ensure_ascii=False, indent=2))
 PYEOF
 
-info "🚀 启动: $WINDOW_ID ($PROVIDER) @ $DIR"
+PROVIDER_LABEL="$PROVIDER"
+[[ -n "$AUTH_PROFILE" ]] && PROVIDER_LABEL="$PROVIDER/$AUTH_PROFILE"
+info "🚀 启动: $WINDOW_ID ($PROVIDER_LABEL) @ $DIR"
 exec tmux attach -t "$WINDOW_ID"

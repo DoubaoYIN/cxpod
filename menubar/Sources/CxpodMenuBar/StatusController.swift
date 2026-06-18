@@ -6,6 +6,7 @@ final class StatusController: NSObject, NSWindowDelegate {
     private let menuBarIcon = StatusController.makeMenuBarIcon()
     private let sessionManager = SessionManager()
     private let providerManager = ProviderManager()
+    private let authProfileManager = AuthProfileManager()
     private let projectManager = ProjectManager()
     private var popover: NSPopover?
     private let vm = PopoverViewModel()
@@ -41,18 +42,23 @@ final class StatusController: NSObject, NSWindowDelegate {
         }
         providerManager.start()
 
+        authProfileManager.onChange = { [weak self] in
+            DispatchQueue.main.async { self?.refreshVM() }
+        }
+        authProfileManager.start()
+
         projectManager.onChange = { [weak self] in
             DispatchQueue.main.async { self?.refreshVM() }
         }
         projectManager.start()
 
-        vm.onLaunch = { [weak self] provider, project, terminal in
+        vm.onLaunch = { [weak self] provider, project, terminal, account in
             self?.popover?.close()
-            self?.doLaunch(provider: provider, project: project, terminalName: terminal)
+            self?.doLaunch(provider: provider, authProfile: account, project: project, terminalName: terminal)
         }
-        vm.onSwitch = { [weak self] session, target in
+        vm.onSwitch = { [weak self] session, target, account in
             self?.popover?.close()
-            self?.doSwitch(session: session, target: target)
+            self?.doSwitch(session: session, target: target, authProfile: account)
         }
         vm.onClose = { [weak self] session in self?.doClose(session: session) }
         vm.onQuit = { NSApp.terminate(nil) }
@@ -62,9 +68,9 @@ final class StatusController: NSObject, NSWindowDelegate {
         vm.onAddProject = { [weak self] in
             self?.popover?.close(); self?.showAddProjectDialog()
         }
-        vm.onCodexAppSwitch = { [weak self] target in
+        vm.onCodexAppSwitch = { [weak self] target, account in
             self?.popover?.close()
-            self?.doCodexAppSwitch(target: target)
+            self?.doCodexAppSwitch(target: target, authProfile: account)
         }
         vm.onShowCodexSessionOrganizer = { [weak self] in
             self?.popover?.close()
@@ -88,7 +94,7 @@ final class StatusController: NSObject, NSWindowDelegate {
 
     func stop() {
         stopBalanceAutoRefresh()
-        sessionManager.stop(); providerManager.stop(); projectManager.stop()
+        sessionManager.stop(); providerManager.stop(); authProfileManager.stop(); projectManager.stop()
         if let item = statusItem { NSStatusBar.system.removeStatusItem(item) }
         statusItem = nil
     }
@@ -113,7 +119,7 @@ final class StatusController: NSObject, NSWindowDelegate {
     }
 
     private func refreshVM() {
-        vm.refresh(providerManager: providerManager, projectManager: projectManager, sessionManager: sessionManager)
+        vm.refresh(providerManager: providerManager, authProfileManager: authProfileManager, projectManager: projectManager, sessionManager: sessionManager)
     }
 
     private func startBalanceAutoRefresh() {
@@ -162,7 +168,8 @@ final class StatusController: NSObject, NSWindowDelegate {
         if sessions.isEmpty { tooltip = "CxPod" }
         else if sessions.count == 1 {
             let s = sessions[0]
-            tooltip = "CxPod #\(s.sessionNumber) \(s.provider) · \(s.projectName)"
+            let providerLabel = s.authProfile.isEmpty ? s.provider : "\(s.provider)/\(s.authProfile)"
+            tooltip = "CxPod #\(s.sessionNumber) \(providerLabel) · \(s.projectName)"
         } else {
             let nums = sessions.map { "#\($0.sessionNumber)" }.joined(separator: " ")
             tooltip = "CxPod \(sessions.count) 个会话 · \(nums)"
@@ -249,29 +256,40 @@ final class StatusController: NSObject, NSWindowDelegate {
         }
     }
 
-    private func doLaunch(provider: String, project: String, terminalName: String) {
+    private func doLaunch(provider: String, authProfile: String?, project: String, terminalName: String) {
         let adapter = TerminalRegistry.shared.adapters.first { $0.name == terminalName }
             ?? TerminalRegistry.shared.defaultAdapter
         let cli = locateCLI("cxstart")
-        let command = "\(shellQuote(cli)) -d \(shellQuote(project)) -p \(shellQuote(provider))"
+        var command = "\(shellQuote(cli)) -d \(shellQuote(project)) -p \(shellQuote(provider))"
+        if let authProfile, !authProfile.isEmpty {
+            command += " --account \(shellQuote(authProfile))"
+        }
         let projectName = (project as NSString).lastPathComponent
-        let title = "cxpod · \(provider) · \(projectName)"
+        let providerLabel = (authProfile?.isEmpty == false) ? "\(provider)/\(authProfile!)" : provider
+        let title = "cxpod · \(providerLabel) · \(projectName)"
         DispatchQueue.global().async { [weak self] in
             do { try adapter.openNewWindow(command: command, title: title) }
             catch { DispatchQueue.main.async { self?.showError(error) } }
         }
     }
 
-    private func doSwitch(session: SessionInfo, target: String) {
-        runInBackground(executable: locateCLI("cxuse"),
-                        arguments: ["--window", session.windowID, target])
+    private func doSwitch(session: SessionInfo, target: String, authProfile: String?) {
+        var arguments = ["--window", session.windowID, target]
+        if let authProfile, !authProfile.isEmpty {
+            arguments += ["--account", authProfile]
+        }
+        runInBackground(executable: locateCLI("cxuse"), arguments: arguments)
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             self?.sessionManager.reload(); self?.refreshVM()
         }
     }
 
-    private func doCodexAppSwitch(target: String) {
-        runInBackground(executable: locateCLI("cx-app-switch"), arguments: [target])
+    private func doCodexAppSwitch(target: String, authProfile: String?) {
+        var arguments = [target]
+        if let authProfile, !authProfile.isEmpty {
+            arguments += ["--account", authProfile]
+        }
+        runInBackground(executable: locateCLI("cx-app-switch"), arguments: arguments)
         // Refresh after Codex.app finishes restarting so currentCodexAppProvider updates.
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
             self?.refreshVM()

@@ -35,6 +35,15 @@ if [[ "$changed" != "1" ]]; then
   exit 1
 fi
 
+generated_title="CxPod Auto Name Check"
+sqlite3 "$TMP_DB" "UPDATE threads SET title = '$generated_title' WHERE id = '$first_id';"
+renamed="$(sqlite3 "$TMP_DB" "SELECT COUNT(*) FROM threads WHERE id = '$first_id' AND title = '$generated_title';")"
+
+if [[ "$renamed" != "1" ]]; then
+  echo "organizer sqlite title update check failed" >&2
+  exit 1
+fi
+
 cat > "$TMP_DIR/codex-session-projects.json" <<JSON
 {
   "pendingThreadProjects": {

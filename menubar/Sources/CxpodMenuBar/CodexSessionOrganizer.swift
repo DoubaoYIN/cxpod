@@ -6,21 +6,33 @@ import UniformTypeIdentifiers
 struct CodexSessionThread: Identifiable, Hashable {
     let id: String
     let title: String
+    let firstUserMessage: String
+    let preview: String
     let cwd: String
     let modelProvider: String
     let updatedAtMs: Int64
     let archived: Bool
     let rolloutPath: String
 
+    var hasExplicitTitle: Bool {
+        !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     var displayTitle: String {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? "未命名会话" : trimmed
+        if !trimmed.isEmpty { return trimmed }
+        let firstMessage = firstUserMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !firstMessage.isEmpty { return firstMessage }
+        let previewText = preview.trimmingCharacters(in: .whitespacesAndNewlines)
+        return previewText.isEmpty ? "未命名会话" : previewText
     }
 
     func overridingCwd(_ newCwd: String) -> CodexSessionThread {
         CodexSessionThread(
             id: id,
             title: title,
+            firstUserMessage: firstUserMessage,
+            preview: preview,
             cwd: newCwd,
             modelProvider: modelProvider,
             updatedAtMs: updatedAtMs,
@@ -71,6 +83,8 @@ private struct SavedCodexProjectsConfig: Codable {
 private struct SQLiteThreadRow: Decodable {
     let id: String
     let title: String?
+    let firstUserMessage: String?
+    let preview: String?
     let cwd: String
     let modelProvider: String
     let updatedAtMs: Int64?
@@ -130,10 +144,11 @@ final class CodexSessionOrganizer {
     private let managedRoot: URL
     private let unassignedURL: URL
     private let deletedProjectURL: URL
+    private let checksCodexRunning: Bool
     private var backupRootURL: URL?
 
-    init() {
-        home = fm.homeDirectoryForCurrentUser
+    init(home: URL = FileManager.default.homeDirectoryForCurrentUser, checksCodexRunning: Bool = true) {
+        self.home = home
         codexHome = home.appendingPathComponent(".codex", isDirectory: true)
         stateDB = codexHome.appendingPathComponent("state_5.sqlite")
         globalStateURL = codexHome.appendingPathComponent(".codex-global-state.json")
@@ -141,6 +156,7 @@ final class CodexSessionOrganizer {
         managedRoot = home.appendingPathComponent(".cxpod/p", isDirectory: true)
         unassignedURL = managedRoot.appendingPathComponent("未归类", isDirectory: true)
         deletedProjectURL = managedRoot.appendingPathComponent("待整理-原项目已删除", isDirectory: true)
+        self.checksCodexRunning = checksCodexRunning
     }
 
     var unassignedPath: String { unassignedURL.path }
@@ -150,7 +166,9 @@ final class CodexSessionOrganizer {
         let whereClause = includeArchived ? "" : "WHERE archived = 0"
         let sql = """
         SELECT id,
-               CASE WHEN title != '' THEN title ELSE first_user_message END AS title,
+               title,
+               first_user_message AS firstUserMessage,
+               preview,
                cwd,
                model_provider AS modelProvider,
                COALESCE(updated_at_ms, updated_at * 1000) AS updatedAtMs,
@@ -167,6 +185,8 @@ final class CodexSessionOrganizer {
             CodexSessionThread(
                 id: $0.id,
                 title: $0.title ?? "",
+                firstUserMessage: $0.firstUserMessage ?? "",
+                preview: $0.preview ?? "",
                 cwd: $0.cwd,
                 modelProvider: $0.modelProvider,
                 updatedAtMs: $0.updatedAtMs ?? 0,
@@ -348,6 +368,37 @@ final class CodexSessionOrganizer {
         return CodexSessionMutationSummary(changedThreads: threads.count, rolloutWarnings: warnings)
     }
 
+    func suggestedTitle(for thread: CodexSessionThread) -> String {
+        let rolloutCandidates = rolloutUserMessages(atPath: thread.rolloutPath, limit: 8).reversed()
+        for candidate in rolloutCandidates {
+            if let title = titleCandidate(from: candidate) { return title }
+        }
+
+        for candidate in [thread.firstUserMessage, thread.preview, thread.displayTitle] {
+            if let title = titleCandidate(from: candidate) { return title }
+        }
+
+        return "未命名会话"
+    }
+
+    func renameThreads(titleByID: [String: String]) throws -> CodexSessionMutationSummary {
+        let changes = titleByID
+            .mapValues { normalizedGeneratedTitle($0) }
+            .filter { !$0.value.isEmpty }
+        guard !changes.isEmpty else { return CodexSessionMutationSummary(changedThreads: 0, rolloutWarnings: 0) }
+        try ensureCodexNotRunning()
+        try backupDatabaseIfNeeded()
+
+        var statements = ["BEGIN IMMEDIATE;"]
+        for (threadID, title) in changes.sorted(by: { $0.key < $1.key }) {
+            statements.append("UPDATE threads SET title = \(sqlQuote(title)) WHERE id = \(sqlQuote(threadID));")
+        }
+        statements.append("COMMIT;")
+        _ = try runSQLite(arguments: ["-bail", stateDB.path, statements.joined(separator: "\n")])
+
+        return CodexSessionMutationSummary(changedThreads: changes.count, rolloutWarnings: 0)
+    }
+
     func quitCodexApp() {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
@@ -369,7 +420,9 @@ final class CodexSessionOrganizer {
     private func readThreads(matchingCwd cwd: String) throws -> [CodexSessionThread] {
         let sql = """
         SELECT id,
-               CASE WHEN title != '' THEN title ELSE first_user_message END AS title,
+               title,
+               first_user_message AS firstUserMessage,
+               preview,
                cwd,
                model_provider AS modelProvider,
                COALESCE(updated_at_ms, updated_at * 1000) AS updatedAtMs,
@@ -386,6 +439,8 @@ final class CodexSessionOrganizer {
             CodexSessionThread(
                 id: $0.id,
                 title: $0.title ?? "",
+                firstUserMessage: $0.firstUserMessage ?? "",
+                preview: $0.preview ?? "",
                 cwd: $0.cwd,
                 modelProvider: $0.modelProvider,
                 updatedAtMs: $0.updatedAtMs ?? 0,
@@ -405,6 +460,156 @@ final class CodexSessionOrganizer {
             }
         }
         return warnings
+    }
+
+    private func rolloutUserMessages(atPath path: String, limit: Int) -> [String] {
+        guard !path.isEmpty, fm.fileExists(atPath: path), limit > 0 else { return [] }
+        let url = URL(fileURLWithPath: path)
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return [] }
+        defer { try? handle.close() }
+
+        var buffer = Data()
+        var messages: [String] = []
+        let newline = UInt8(ascii: "\n")
+        let maxLineBytes = 2 * 1024 * 1024
+
+        func consume(_ line: Data) {
+            guard !line.isEmpty, line.count <= maxLineBytes,
+                  let message = parseRolloutUserMessage(line) else {
+                return
+            }
+            messages.append(message)
+            if messages.count > limit {
+                messages.removeFirst(messages.count - limit)
+            }
+        }
+
+        while true {
+            guard let chunk = try? handle.read(upToCount: 64 * 1024), !chunk.isEmpty else { break }
+            buffer.append(chunk)
+            while let newlineIndex = buffer.firstIndex(of: newline) {
+                consume(Data(buffer[..<newlineIndex]))
+                buffer.removeSubrange(buffer.startIndex...newlineIndex)
+            }
+            if buffer.count > maxLineBytes {
+                buffer.removeAll(keepingCapacity: true)
+            }
+        }
+        consume(buffer)
+
+        return messages
+    }
+
+    private func parseRolloutUserMessage(_ line: Data) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+              object["type"] as? String == "response_item",
+              let payload = object["payload"] as? [String: Any],
+              payload["type"] as? String == "message",
+              payload["role"] as? String == "user" else {
+            return nil
+        }
+
+        let content = payload["content"] as? [Any] ?? []
+        let texts: [String] = content.compactMap { part in
+            if let text = part as? String {
+                return text
+            }
+            guard let dict = part as? [String: Any] else { return nil }
+            return (dict["text"] as? String) ?? (dict["input_text"] as? String)
+        }
+        let message = texts.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return message.isEmpty ? nil : message
+    }
+
+    private func titleCandidate(from raw: String) -> String? {
+        let text = removeTaggedBlocks(from: raw, tag: "environment_context")
+        let lines = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .components(separatedBy: .newlines)
+            .compactMap { meaningfulTitleLine($0) }
+        guard !lines.isEmpty else { return nil }
+
+        let joined = lines.prefix(3).joined(separator: " ")
+        let normalized = normalizedGeneratedTitle(joined)
+        guard !normalized.isEmpty, !isGenericTitle(normalized) else { return nil }
+        return shortenedTitle(normalized)
+    }
+
+    private func meaningfulTitleLine(_ line: String) -> String? {
+        var value = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+
+        let lower = value.lowercased()
+        let ignoredPrefixes = [
+            "<instructions", "</instructions", "# agents.md instructions",
+            "knowledge cutoff:", "current date:", "<environment_context",
+            "</environment_context", "<cwd>", "<shell>", "<current_date>",
+            "<timezone>", "<filesystem>", "</filesystem>", "```"
+        ]
+        if ignoredPrefixes.contains(where: { lower.hasPrefix($0) }) { return nil }
+
+        while let first = value.first, "#-*•> ".contains(first) {
+            value.removeFirst()
+            value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if value.lowercased().hasPrefix("user:") {
+            value = String(value.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return value.isEmpty ? nil : value
+    }
+
+    private func normalizedGeneratedTitle(_ raw: String) -> String {
+        var value = raw
+            .replacingOccurrences(of: "\t", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        value = value.components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        value = value.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
+        return value
+    }
+
+    private func shortenedTitle(_ title: String, maxLength: Int = 36) -> String {
+        guard title.count > maxLength else { return title }
+        let stopCharacters = Set("。！？!?；;：:")
+        var bestStop: String.Index?
+        var index = title.startIndex
+        var offset = 0
+        while index < title.endIndex, offset < maxLength {
+            if offset >= 8, stopCharacters.contains(title[index]) {
+                bestStop = index
+                break
+            }
+            title.formIndex(after: &index)
+            offset += 1
+        }
+        if let bestStop {
+            let prefix = String(title[..<bestStop])
+                .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
+            if !prefix.isEmpty { return prefix }
+        }
+
+        let end = title.index(title.startIndex, offsetBy: maxLength)
+        return String(title[..<end])
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters)) + "..."
+    }
+
+    private func isGenericTitle(_ title: String) -> Bool {
+        let lower = title.lowercased()
+        let generic = ["继续", "好的", "可以", "确认", "ok", "okay", "yes", "no", "hi", "hello"]
+        return generic.contains(lower)
+    }
+
+    private func removeTaggedBlocks(from raw: String, tag: String) -> String {
+        var text = raw
+        let open = "<\(tag)>"
+        let close = "</\(tag)>"
+        while let start = text.range(of: open),
+              let end = text.range(of: close, range: start.upperBound..<text.endIndex) {
+            text.removeSubrange(start.lowerBound..<end.upperBound)
+        }
+        return text
     }
 
     private func rewriteRolloutCwd(atPath path: String, newCwd: String) throws {
@@ -531,6 +736,7 @@ final class CodexSessionOrganizer {
     }
 
     private func ensureCodexNotRunning() throws {
+        guard checksCodexRunning else { return }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
         process.arguments = ["-f", "/Applications/Codex.app/"]
@@ -728,6 +934,9 @@ final class CodexSessionOrganizerViewModel: ObservableObject {
     @Published var selectedProjectID: String?
     @Published var includeArchived = false
     @Published var searchText = ""
+    @Published var projectSearchText = ""
+    @Published var hideEmptyProjects = false
+    @Published var showPendingOnly = false
     @Published var statusText = "重启 Codex.app 后生效"
     @Published var errorText: String?
     @Published var selectedThreadIDs = Set<String>()
@@ -742,14 +951,35 @@ final class CodexSessionOrganizerViewModel: ObservableObject {
     }
 
     var selectedThreads: [CodexSessionThread] {
-        guard let project = selectedProject else { return [] }
+        let baseThreads: [CodexSessionThread]
+        if showPendingOnly {
+            baseThreads = threads.filter { pendingMoves[$0.id] != nil }
+        } else {
+            guard let project = selectedProject else { return [] }
+            baseThreads = threads.filter { $0.cwd == project.path }
+        }
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return threads.filter { thread in
-            guard thread.cwd == project.path else { return false }
+        return baseThreads.filter { thread in
             guard !query.isEmpty else { return true }
             return thread.displayTitle.lowercased().contains(query)
                 || thread.modelProvider.lowercased().contains(query)
                 || thread.id.lowercased().contains(query)
+                || thread.cwd.lowercased().contains(query)
+        }
+    }
+
+    var visibleProjects: [CodexSessionProject] {
+        let query = projectSearchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return projects.filter { project in
+            if hideEmptyProjects,
+               project.count == 0,
+               project.id != selectedProjectID,
+               !project.isSystem {
+                return false
+            }
+            guard !query.isEmpty else { return true }
+            return project.name.lowercased().contains(query)
+                || project.path.lowercased().contains(query)
         }
     }
 
@@ -838,7 +1068,19 @@ final class CodexSessionOrganizerViewModel: ObservableObject {
     }
 
     func selectProject(_ project: CodexSessionProject) {
+        showPendingOnly = false
         selectedProjectID = project.id
+        selectedThreadIDs.removeAll()
+    }
+
+    func showPendingChanges() {
+        showPendingOnly = true
+        selectedThreadIDs.removeAll()
+        statusText = "正在查看待同步改动"
+    }
+
+    func showSelectedProject() {
+        showPendingOnly = false
         selectedThreadIDs.removeAll()
     }
 
@@ -859,6 +1101,59 @@ final class CodexSessionOrganizerViewModel: ObservableObject {
         selectedProjectID = project.id
         selectedThreadIDs.removeAll()
         statusText = "已放入待同步：\(moving.count) 个会话"
+    }
+
+    func actionThreadIDs(triggeredBy id: String) -> [String] {
+        if selectedThreadIDs.contains(id), !selectedThreadIDs.isEmpty {
+            return Array(selectedThreadIDs)
+        }
+        return [id]
+    }
+
+    func autoNameSelectedThreads() {
+        autoNameThreads(ids: Array(selectedThreadIDs))
+    }
+
+    func autoNameThreadAction(id: String) {
+        autoNameThreads(ids: actionThreadIDs(triggeredBy: id))
+    }
+
+    func autoNameThreads(ids: [String]) {
+        let idSet = Set(ids)
+        let targetThreads = threads.filter { idSet.contains($0.id) }
+        guard !targetThreads.isEmpty else {
+            statusText = "没有选中会话"
+            return
+        }
+
+        let titledThreads = targetThreads.filter(\.hasExplicitTitle)
+        if !titledThreads.isEmpty, !confirmOverwriteTitles(titledThreads) {
+            statusText = "已取消自动命名"
+            return
+        }
+
+        var titleByID: [String: String] = [:]
+        for thread in targetThreads {
+            let suggested = organizer.suggestedTitle(for: thread)
+            let current = thread.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !suggested.isEmpty, suggested != current {
+                titleByID[thread.id] = suggested
+            }
+        }
+
+        guard !titleByID.isEmpty else {
+            statusText = "没有可更新的标题"
+            return
+        }
+
+        do {
+            let summary = try organizer.renameThreads(titleByID: titleByID)
+            reload()
+            statusText = summaryText(prefix: "已自动命名", summary: summary)
+        } catch {
+            showAutoNameBlockedAlert(message: error.localizedDescription)
+            errorText = error.localizedDescription
+        }
     }
 
     func selectAllVisibleThreads() {
@@ -904,6 +1199,7 @@ final class CodexSessionOrganizerViewModel: ObservableObject {
         do {
             let summary = try organizer.applyPendingMoves(pendingMoves, originalThreads: originalThreads)
             pendingMoves.removeAll()
+            showPendingOnly = false
             reload()
             statusText = summaryText(prefix: "已同步到 Codex", summary: summary)
         } catch {
@@ -915,8 +1211,21 @@ final class CodexSessionOrganizerViewModel: ObservableObject {
     func discardPendingMoves() {
         pendingMoves.removeAll()
         organizer.savePendingMoves([:])
+        showPendingOnly = false
         reload()
         statusText = "已撤销待同步改动"
+    }
+
+    func revealSelectedThreadInFinder() {
+        guard selectedThreadIDs.count == 1,
+              let id = selectedThreadIDs.first else { return }
+        revealThreadInFinder(id: id)
+    }
+
+    func revealThreadInFinder(id: String) {
+        guard let path = threads.first(where: { $0.id == id })?.rolloutPath,
+              !path.isEmpty else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
     }
 
     func quitCodexApp() {
@@ -944,6 +1253,31 @@ final class CodexSessionOrganizerViewModel: ObservableObject {
         alert.addButton(withTitle: "知道了")
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
+    }
+
+    private func showAutoNameBlockedAlert(message: String) {
+        let alert = NSAlert()
+        alert.messageText = "暂未自动命名"
+        alert.informativeText = "\(message)\n\n请退出 Codex.app 后重试。"
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "知道了")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
+
+    private func confirmOverwriteTitles(_ threads: [CodexSessionThread]) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "重新生成标题？"
+        if threads.count == 1 {
+            alert.informativeText = "“\(threads[0].displayTitle)”已有标题，自动命名会覆盖当前标题。"
+        } else {
+            alert.informativeText = "\(threads.count) 个会话已有标题，自动命名会覆盖这些标题。"
+        }
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "重新生成")
+        alert.addButton(withTitle: "取消")
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     private func prompt(title: String, message: String, defaultValue: String) -> String? {
@@ -1023,9 +1357,23 @@ struct CodexSessionOrganizerView: View {
                 .font(.system(size: 11))
                 .foregroundColor(.secondary)
 
+            TextField("搜索项目", text: $vm.projectSearchText)
+                .textFieldStyle(.roundedBorder)
+                .controlSize(.small)
+
+            HStack(spacing: 8) {
+                Toggle("隐藏空项目", isOn: $vm.hideEmptyProjects)
+                    .toggleStyle(.checkbox)
+                Spacer()
+                Button("待同步") { vm.showPendingChanges() }
+                    .disabled(vm.pendingMoves.isEmpty)
+            }
+            .font(.system(size: 12))
+            .controlSize(.small)
+
             ScrollView {
                 LazyVStack(spacing: 4) {
-                    ForEach(vm.projects) { project in
+                    ForEach(vm.visibleProjects) { project in
                         CodexProjectDropRow(
                             project: project,
                             isSelected: project.id == vm.selectedProjectID,
@@ -1054,22 +1402,40 @@ struct CodexSessionOrganizerView: View {
             }
 
             ScrollView {
-                LazyVStack(spacing: 6) {
-                    ForEach(vm.selectedThreads) { thread in
-                        CodexThreadRow(
-                            thread: thread,
-                            isSelected: vm.selectedThreadIDs.contains(thread.id),
-                            isPending: vm.pendingMoves[thread.id] != nil,
-                            isCut: vm.cutThreadIDs.contains(thread.id),
-                            dragPayload: vm.dragPayload(for: thread),
-                            onSelectionChange: { selected in
-                                vm.setThreadSelection(thread.id, selected: selected)
-                            }
-                        )
+                if vm.selectedThreads.isEmpty {
+                    VStack(spacing: 6) {
+                        Image(systemName: vm.showPendingOnly ? "tray" : "bubble.left.and.bubble.right")
+                            .font(.system(size: 24))
+                            .foregroundColor(.secondary.opacity(0.55))
+                        Text(vm.showPendingOnly ? "没有待同步改动" : "没有会话")
+                            .font(.system(size: 13))
+                            .foregroundColor(.secondary)
                     }
+                    .frame(maxWidth: .infinity, minHeight: 180)
+                } else {
+                    LazyVStack(spacing: 6) {
+                        ForEach(vm.selectedThreads) { thread in
+                            CodexThreadRow(
+                                thread: thread,
+                                isSelected: vm.selectedThreadIDs.contains(thread.id),
+                                isPending: vm.pendingMoves[thread.id] != nil,
+                                isCut: vm.cutThreadIDs.contains(thread.id),
+                                dragPayload: vm.dragPayload(for: thread),
+                                moveTargets: vm.projects.filter { $0.path != thread.cwd },
+                                onSelectionChange: { selected in
+                                    vm.setThreadSelection(thread.id, selected: selected)
+                                },
+                                onMoveToProject: { project in
+                                    vm.moveThreads(ids: vm.actionThreadIDs(triggeredBy: thread.id), to: project)
+                                },
+                                onAutoName: { vm.autoNameThreadAction(id: thread.id) },
+                                onReveal: { vm.revealThreadInFinder(id: thread.id) }
+                            )
+                        }
+                    }
+                    .padding(.vertical, 4)
+                    .padding(.horizontal, 2)
                 }
-                .padding(.vertical, 4)
-                .padding(.horizontal, 2)
             }
             .background(Color(NSColor.textBackgroundColor))
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -1087,6 +1453,14 @@ struct CodexSessionOrganizerView: View {
                 .disabled(vm.selectedThreadIDs.isEmpty)
                 Button("移到未归类") {
                     vm.moveSelectedThreadsToUnassigned()
+                }
+                .disabled(vm.selectedThreadIDs.isEmpty)
+                Button("显示所选会话文件") {
+                    vm.revealSelectedThreadInFinder()
+                }
+                .disabled(vm.selectedThreadIDs.count != 1)
+                Button("自动命名所选") {
+                    vm.autoNameSelectedThreads()
                 }
                 .disabled(vm.selectedThreadIDs.isEmpty)
                 Button("剪切") {
@@ -1115,7 +1489,7 @@ struct CodexSessionOrganizerView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top, spacing: 12) {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(vm.selectedProject?.name ?? "会话")
+                    Text(vm.showPendingOnly ? "待同步改动" : (vm.selectedProject?.name ?? "会话"))
                         .font(.system(size: 18, weight: .semibold))
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -1164,6 +1538,16 @@ struct CodexSessionOrganizerView: View {
 
                 Button("移到未归类") { vm.moveSelectedThreadsToUnassigned() }
                     .disabled(vm.selectedThreadIDs.isEmpty)
+                Button("显示文件") { vm.revealSelectedThreadInFinder() }
+                    .disabled(vm.selectedThreadIDs.count != 1)
+                Button("自动命名") { vm.autoNameSelectedThreads() }
+                    .disabled(vm.selectedThreadIDs.isEmpty)
+                if vm.showPendingOnly {
+                    Button("返回项目") { vm.showSelectedProject() }
+                } else {
+                    Button("待同步") { vm.showPendingChanges() }
+                        .disabled(vm.pendingMoves.isEmpty)
+                }
 
                 Spacer(minLength: 8)
             }
@@ -1229,8 +1613,8 @@ private struct CodexProjectDropRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Image(systemName: project.isUnassigned ? "tray" : "folder")
-                .foregroundColor(project.isUnassigned ? .secondary : .accentColor)
+            Image(systemName: projectIconName)
+                .foregroundColor(project.isSystem ? .secondary : .accentColor)
                 .frame(width: 18)
             VStack(alignment: .leading, spacing: 1) {
                 Text(project.name)
@@ -1279,6 +1663,12 @@ private struct CodexProjectDropRow: View {
         return Color.clear
     }
 
+    private var projectIconName: String {
+        if project.isUnassigned { return "tray" }
+        if project.isSystem { return "exclamationmark.folder" }
+        return "folder"
+    }
+
     private func parseDraggedThreadIDs(_ value: String) -> [String] {
         if let data = value.data(using: .utf8),
            let ids = try? JSONDecoder().decode([String].self, from: data) {
@@ -1294,7 +1684,11 @@ private struct CodexThreadRow: View {
     let isPending: Bool
     let isCut: Bool
     let dragPayload: String
+    let moveTargets: [CodexSessionProject]
     let onSelectionChange: (Bool) -> Void
+    let onMoveToProject: (CodexSessionProject) -> Void
+    let onAutoName: () -> Void
+    let onReveal: () -> Void
 
     var body: some View {
         HStack(spacing: 10) {
@@ -1355,6 +1749,16 @@ private struct CodexThreadRow: View {
         .opacity(isCut ? 0.55 : 1)
         .onDrag {
             NSItemProvider(object: dragPayload as NSString)
+        }
+        .contextMenu {
+            Button("自动命名") { onAutoName() }
+            Menu("更改项目...") {
+                ForEach(moveTargets) { project in
+                    Button(project.name) { onMoveToProject(project) }
+                }
+            }
+            .disabled(moveTargets.isEmpty)
+            Button("显示会话文件") { onReveal() }
         }
     }
 

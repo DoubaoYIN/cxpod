@@ -4,6 +4,7 @@ import Foundation
 struct SessionInfo {
     let windowID: String
     let provider: String
+    let authProfile: String
     let model: String
     let projectDir: String
     let updatedAt: String
@@ -68,6 +69,7 @@ final class SessionManager {
 
             let wid = obj["window_id"] as? String ?? file.deletingPathExtension().lastPathComponent
             let prov = obj["provider"] as? String ?? "?"
+            let auth = obj["auth_profile"] as? String ?? ""
             let mdl = obj["model"] as? String ?? ""
             let dir = obj["project_dir"] as? String ?? ""
             let upd = obj["updated_at"] as? String ?? ""
@@ -76,7 +78,7 @@ final class SessionManager {
             // Check whether tmux session actually exists.
             if tmuxSessionExists(wid) {
                 newSessions.append(SessionInfo(
-                    windowID: wid, provider: prov, model: mdl,
+                    windowID: wid, provider: prov, authProfile: auth, model: mdl,
                     projectDir: dir, updatedAt: upd, tmuxTarget: tgt
                 ))
             }
@@ -86,6 +88,9 @@ final class SessionManager {
 
         if newSessions.map(\.windowID) != sessions.map(\.windowID)
             || newSessions.map(\.provider) != sessions.map(\.provider) {
+            sessions = newSessions
+            onChange?()
+        } else if newSessions.map(\.authProfile) != sessions.map(\.authProfile) {
             sessions = newSessions
             onChange?()
         } else {

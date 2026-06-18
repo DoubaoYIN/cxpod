@@ -158,7 +158,7 @@ pick_bin_dir() {
 }
 
 install_cli_links() {
-  local cmds=(cxstart cxuse cxnow cx-status cx-app-switch)
+  local cmds=(cxstart cxuse cxauth cxnow cx-status cx-app-switch)
   for cmd in "${cmds[@]}"; do
     local src="$REPO/bin/$cmd"
     local dest="$BIN_DIR/$cmd"

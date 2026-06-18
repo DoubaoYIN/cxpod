@@ -29,6 +29,9 @@ CXPOD_LOG_FILE="$CXPOD_HOME/log/cxpod.log"
 CXPOD_ENV_FILE="$CXPOD_HOME/env"
 CXPOD_AUTH_DIR="$CXPOD_HOME/codex-auth"
 CXPOD_OAUTH_AUTH="$CXPOD_AUTH_DIR/oauth.json"
+CXPOD_AUTH_ACCOUNTS_DIR="$CXPOD_AUTH_DIR/accounts"
+CXPOD_CURRENT_AUTH_PROFILE_FILE="$CXPOD_HOME/current-auth-profile"
+CXPOD_CODEX_APP_AUTH_PROFILE_FILE="$CXPOD_HOME/current-codex-app-auth-profile"
 CXPOD_CONTEXT_DIR="$CXPOD_HOME/context"
 
 CXPOD_CODEX_APP_BIN="/Applications/Codex.app/Contents/Resources/codex"
@@ -44,9 +47,11 @@ CXPOD_USER_CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 # ─── Logging ──────────────────────────────────────────────
 ensure_runtime_dirs() {
   mkdir -p "$CXPOD_HOME" "$CXPOD_PROVIDERS_USER_DIR" "$CXPOD_STATE_DIR" \
-    "$CXPOD_HOMES_DIR" "$CXPOD_AUTH_DIR" "$CXPOD_CONTEXT_DIR" "$(dirname "$CXPOD_LOG_FILE")"
+    "$CXPOD_HOMES_DIR" "$CXPOD_AUTH_DIR" "$CXPOD_AUTH_ACCOUNTS_DIR" \
+    "$CXPOD_CONTEXT_DIR" "$(dirname "$CXPOD_LOG_FILE")"
   chmod 700 "$CXPOD_HOME" "$CXPOD_PROVIDERS_USER_DIR" "$CXPOD_STATE_DIR" \
-    "$CXPOD_HOMES_DIR" "$CXPOD_AUTH_DIR" "$CXPOD_CONTEXT_DIR" "$(dirname "$CXPOD_LOG_FILE")" \
+    "$CXPOD_HOMES_DIR" "$CXPOD_AUTH_DIR" "$CXPOD_AUTH_ACCOUNTS_DIR" \
+    "$CXPOD_CONTEXT_DIR" "$(dirname "$CXPOD_LOG_FILE")" \
     2>/dev/null || true
   [[ -f "$CXPOD_ENV_FILE" ]] && chmod 600 "$CXPOD_ENV_FILE" 2>/dev/null || true
   [[ -f "$CXPOD_OAUTH_AUTH" ]] && chmod 600 "$CXPOD_OAUTH_AUTH" 2>/dev/null || true
@@ -86,6 +91,10 @@ is_valid_provider_name() {
 
 is_valid_window_id() {
   [[ "$1" =~ ^cx-[0-9]+$ ]]
+}
+
+is_valid_auth_profile_name() {
+  [[ "$1" =~ ^[A-Za-z0-9._-]+$ && "$1" != "." && "$1" != ".." ]]
 }
 
 # ─── Provider discovery ───────────────────────────────────
@@ -197,45 +206,175 @@ copy_if_chatgpt_auth() {
   chmod 600 "$target" 2>/dev/null || true
 }
 
+auth_profile_file() {
+  local profile="$1"
+  is_valid_auth_profile_name "$profile" || die "账号名称非法: '$profile'"
+  printf '%s/%s.json' "$CXPOD_AUTH_ACCOUNTS_DIR" "$profile"
+}
+
+list_auth_profiles() {
+  local seen="" f name
+  for f in "$CXPOD_AUTH_ACCOUNTS_DIR"/*.json; do
+    [[ -f "$f" ]] || continue
+    name="$(basename "$f" .json)"
+    is_valid_auth_profile_name "$name" || continue
+    case " $seen " in *" $name "*) continue ;; esac
+    seen="$seen $name"
+    printf '%s\n' "$name"
+  done
+  if [[ -f "$CXPOD_OAUTH_AUTH" && " $seen " != *" default "* ]]; then
+    printf '%s\n' "default"
+  fi
+}
+
+resolve_auth_profile() {
+  local q="$1"
+  is_valid_auth_profile_name "$q" || die "账号名称非法: '$q'"
+  local all
+  all="$(list_auth_profiles)"
+  if printf '%s\n' "$all" | grep -qx "$q"; then
+    printf '%s' "$q"
+    return 0
+  fi
+  local matches=()
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    [[ "$name" == "$q"* ]] && matches+=("$name")
+  done <<< "$all"
+  case ${#matches[@]} in
+    0) die "未知 GPT 账号: '$q' (运行 'cxauth --list' 查看可用)" ;;
+    1) printf '%s' "${matches[0]}" ;;
+    *) die "GPT 账号 '$q' 不唯一，匹配到: ${matches[*]}" ;;
+  esac
+}
+
+current_auth_profile() {
+  local profile=""
+  if [[ -f "$CXPOD_CURRENT_AUTH_PROFILE_FILE" ]]; then
+    profile="$(tr -d '[:space:]' < "$CXPOD_CURRENT_AUTH_PROFILE_FILE")"
+    if [[ -n "$profile" ]] && is_valid_auth_profile_name "$profile"; then
+      printf '%s' "$profile"
+      return 0
+    fi
+  fi
+  if [[ -f "$CXPOD_AUTH_ACCOUNTS_DIR/default.json" || -f "$CXPOD_OAUTH_AUTH" ]]; then
+    printf '%s' "default"
+    return 0
+  fi
+  list_auth_profiles | head -1
+}
+
+current_codex_app_auth_profile() {
+  local profile=""
+  if [[ -f "$CXPOD_CODEX_APP_AUTH_PROFILE_FILE" ]]; then
+    profile="$(tr -d '[:space:]' < "$CXPOD_CODEX_APP_AUTH_PROFILE_FILE")"
+    if [[ -n "$profile" ]] && is_valid_auth_profile_name "$profile"; then
+      printf '%s' "$profile"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+select_auth_profile() {
+  local requested="${1:-}" profile
+  if [[ -n "$requested" ]]; then
+    resolve_auth_profile "$requested"
+    return 0
+  fi
+  profile="$(current_auth_profile 2>/dev/null || true)"
+  printf '%s' "${profile:-default}"
+}
+
+set_current_auth_profile() {
+  local profile="$1"
+  is_valid_auth_profile_name "$profile" || die "账号名称非法: '$profile'"
+  printf '%s' "$profile" | atomic_write "$CXPOD_CURRENT_AUTH_PROFILE_FILE"
+}
+
+set_current_codex_app_auth_profile() {
+  local profile="$1"
+  is_valid_auth_profile_name "$profile" || die "账号名称非法: '$profile'"
+  printf '%s' "$profile" | atomic_write "$CXPOD_CODEX_APP_AUTH_PROFILE_FILE"
+}
+
+save_auth_profile_from_file() {
+  local profile="$1" source="$2"
+  is_valid_auth_profile_name "$profile" || die "账号名称非法: '$profile'"
+  mkdir -p "$CXPOD_AUTH_ACCOUNTS_DIR"
+  local target; target="$(auth_profile_file "$profile")"
+  if ! copy_if_chatgpt_auth "$source" "$target"; then
+    die "不是 Codex ChatGPT/OAuth 登录态: $source"
+  fi
+  if [[ "$profile" == "default" ]]; then
+    cp "$target" "$CXPOD_OAUTH_AUTH"
+    chmod 600 "$CXPOD_OAUTH_AUTH" 2>/dev/null || true
+  fi
+  set_current_auth_profile "$profile"
+}
+
 sync_oauth_authority_from_codex_home() {
   local source_home="${1:-$CXPOD_USER_CODEX_HOME}"
+  local profile="${2:-}"
+  [[ -n "$profile" ]] || profile="$(current_auth_profile 2>/dev/null || true)"
+  [[ -n "$profile" ]] || profile="default"
   local source="$source_home/auth.json"
   [[ -f "$source" ]] || return 0
-  if copy_if_chatgpt_auth "$source" "$CXPOD_OAUTH_AUTH"; then
-    info "🔐 已回吸 OAuth 凭证: $CXPOD_OAUTH_AUTH"
+  local target; target="$(auth_profile_file "$profile")"
+  if copy_if_chatgpt_auth "$source" "$target"; then
+    if [[ "$profile" == "default" ]]; then
+      cp "$target" "$CXPOD_OAUTH_AUTH"
+      chmod 600 "$CXPOD_OAUTH_AUTH" 2>/dev/null || true
+    fi
+    info "🔐 已回吸 GPT 账号 '$profile' 登录态"
   fi
 }
 
 ensure_oauth_authority() {
-  [[ -f "$CXPOD_OAUTH_AUTH" ]] && return 0
-  mkdir -p "$CXPOD_AUTH_DIR"
+  local profile="${1:-}"
+  [[ -n "$profile" ]] || profile="$(select_auth_profile "")"
+  local account_auth; account_auth="$(auth_profile_file "$profile")"
+  [[ -f "$account_auth" ]] && return 0
+  mkdir -p "$CXPOD_AUTH_DIR" "$CXPOD_AUTH_ACCOUNTS_DIR"
   local current="$CXPOD_USER_CODEX_HOME/auth.json"
   local legacy="$CXPOD_USER_CODEX_HOME/auth.json.chatgpt.bak"
-  if copy_if_chatgpt_auth "$current" "$CXPOD_OAUTH_AUTH"; then
-    info "🔐 已迁移当前 OAuth 凭证: $CXPOD_OAUTH_AUTH"
+  if [[ "$profile" == "default" && -f "$CXPOD_OAUTH_AUTH" ]]; then
+    if copy_if_chatgpt_auth "$CXPOD_OAUTH_AUTH" "$account_auth"; then
+      info "🔐 已迁移默认 GPT 账号: $account_auth"
+      return 0
+    fi
+  fi
+  if [[ "$profile" == "default" ]] && copy_if_chatgpt_auth "$current" "$account_auth"; then
+    cp "$account_auth" "$CXPOD_OAUTH_AUTH"
+    chmod 600 "$CXPOD_OAUTH_AUTH" 2>/dev/null || true
+    info "🔐 已迁移当前 GPT 账号: $account_auth"
     return 0
   fi
-  if copy_if_chatgpt_auth "$legacy" "$CXPOD_OAUTH_AUTH"; then
-    info "🔐 已迁移 OAuth 冷备: $CXPOD_OAUTH_AUTH"
+  if [[ "$profile" == "default" ]] && copy_if_chatgpt_auth "$legacy" "$account_auth"; then
+    cp "$account_auth" "$CXPOD_OAUTH_AUTH"
+    chmod 600 "$CXPOD_OAUTH_AUTH" 2>/dev/null || true
+    info "🔐 已迁移 GPT 账号冷备: $account_auth"
     return 0
   fi
-  die "缺少 OAuth 权威凭证: $CXPOD_OAUTH_AUTH。请先用官方 OpenAI 登录 Codex.app，再重试。"
+  die "缺少 GPT 账号 '$profile' 登录态: $account_auth。请先运行: cxauth login $profile"
 }
 
 sync_auth_json() {
-  local target_home="$1" kind="${2:-official}" provider_name="${3:-}"
+  local target_home="$1" kind="${2:-official}" provider_name="${3:-}" auth_profile="${4:-}"
   local target="$target_home/auth.json"
   mkdir -p "$target_home"
   chmod 700 "$target_home" 2>/dev/null || true
   case "$kind" in
     official)
-      ensure_oauth_authority
+      [[ -n "$auth_profile" ]] || auth_profile="$(select_auth_profile "")"
+      ensure_oauth_authority "$auth_profile"
+      local account_auth; account_auth="$(auth_profile_file "$auth_profile")"
       [[ -e "$target" || -L "$target" ]] && rm -f "$target"
       if [[ "$target_home" == "$CXPOD_USER_CODEX_HOME" ]]; then
-        cp "$CXPOD_OAUTH_AUTH" "$target"
+        cp "$account_auth" "$target"
         chmod 600 "$target" 2>/dev/null || true
       else
-        ln -s "$CXPOD_OAUTH_AUTH" "$target"
+        ln -s "$account_auth" "$target"
       fi
       ;;
     relay)
@@ -265,6 +404,7 @@ seed_window_codex_home() {
   local id="$1"
   local kind="${2:-official}"
   local provider_name="${3:-}"
+  local auth_profile="${4:-}"
   local home; home="$(window_codex_home "$id")"
   mkdir -p "$home"
 
@@ -277,7 +417,7 @@ seed_window_codex_home() {
   # For official providers, link to cxpod's OAuth authority.
   # For relay providers, generate an apikey-mode auth.json so codex
   # sends the provider's api_key as a Bearer token.
-  sync_auth_json "$home" "$kind" "$provider_name"
+  sync_auth_json "$home" "$kind" "$provider_name" "$auth_profile"
   printf '%s' "$home"
 }
 
@@ -481,13 +621,13 @@ write_provider_env_file() {
 # written by other scripts (e.g. tmux_target, project_dir from cxstart)
 # are not lost.
 write_window_state() {
-  local id="$1" provider="$2" model="${3:-}"
+  local id="$1" provider="$2" model="${3:-}" auth_profile="${4:-}"
   is_valid_window_id "$id" || die "window id 非法: $id"
   local ts; ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   local file="$CXPOD_STATE_DIR/$id.json"
-  python3 - "$file" "$id" "$provider" "$model" "$ts" <<'PYEOF' | atomic_write "$file"
+  python3 - "$file" "$id" "$provider" "$model" "$auth_profile" "$ts" <<'PYEOF' | atomic_write "$file"
 import json, os, sys
-path, window_id, provider, model, ts = sys.argv[1:6]
+path, window_id, provider, model, auth_profile, ts = sys.argv[1:7]
 try:
     existing = json.load(open(path)) if os.path.isfile(path) else {}
 except Exception:
@@ -498,6 +638,10 @@ existing.update({
     "model": model,
     "updated_at": ts,
 })
+if auth_profile:
+    existing["auth_profile"] = auth_profile
+else:
+    existing.pop("auth_profile", None)
 print(json.dumps(existing, ensure_ascii=False, indent=2))
 PYEOF
 }

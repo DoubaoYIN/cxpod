@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# cxauth — Manage multiple Codex ChatGPT/OAuth accounts for cxpod.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(
+  src="${BASH_SOURCE[0]}"
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+)"
+
+# shellcheck source=lib/common.sh
+source "$SCRIPT_DIR/lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+cxauth — 管理多个 Codex GPT 账号
+
+USAGE
+  cxauth login <name>          使用 Codex 登录并保存为账号
+  cxauth save <name>           保存当前 ~/.codex/auth.json 为账号
+  cxauth use <name>            设为 cxpod 默认账号
+  cxauth install <name>        写入 ~/.codex/auth.json，供 Codex.app/全局 CLI 使用
+  cxauth remove <name>         删除账号
+  cxauth current               显示默认账号
+  cxauth --list, -l            列出账号
+  cxauth --help, -h
+EOF
+}
+
+list_profiles_pretty() {
+  ensure_runtime_dirs
+  local current app found=0
+  current="$(current_auth_profile 2>/dev/null || true)"
+  app="$(current_codex_app_auth_profile 2>/dev/null || true)"
+  while IFS= read -r profile; do
+    [[ -z "$profile" ]] && continue
+    local marks=()
+    [[ "$profile" == "$current" ]] && marks+=("default")
+    [[ "$profile" == "$app" ]] && marks+=("Codex.app")
+    if (( ${#marks[@]} > 0 )); then
+      local mark_text="${marks[0]}"
+      local i
+      for (( i=1; i<${#marks[@]}; i++ )); do
+        mark_text+=", ${marks[i]}"
+      done
+      printf '%s  (%s)\n' "$profile" "$mark_text"
+    else
+      printf '%s\n' "$profile"
+    fi
+    found=1
+  done < <(list_auth_profiles)
+  (( found )) || echo "(没有 GPT 账号)"
+}
+
+cmd_login() {
+  local profile="$1"
+  is_valid_auth_profile_name "$profile" || die "账号名称非法: '$profile'"
+  require_codex_bin
+  local tmp
+  tmp="$(mktemp -d "$CXPOD_AUTH_DIR/login.$profile.XXXXXX")"
+  cleanup() { rm -rf "$tmp"; }
+  trap cleanup EXIT
+  info "🔐 即将启动 Codex 登录，保存为 GPT 账号: $profile"
+  CODEX_HOME="$tmp" "$CXPOD_CODEX_BIN" login
+  [[ -f "$tmp/auth.json" ]] || die "登录后未找到 auth.json"
+  save_auth_profile_from_file "$profile" "$tmp/auth.json"
+  info "✅ 已保存 GPT 账号: $profile"
+}
+
+cmd_save() {
+  local profile="$1"
+  local source="$CXPOD_USER_CODEX_HOME/auth.json"
+  [[ -f "$source" ]] || die "找不到当前 Codex 登录态: $source"
+  save_auth_profile_from_file "$profile" "$source"
+  info "✅ 已保存 GPT 账号: $profile"
+}
+
+cmd_use() {
+  local profile
+  profile="$(resolve_auth_profile "$1")"
+  ensure_oauth_authority "$profile"
+  set_current_auth_profile "$profile"
+  info "✅ cxpod 默认 GPT 账号已切换为: $profile"
+}
+
+cmd_install() {
+  local profile
+  profile="$(resolve_auth_profile "$1")"
+  sync_auth_json "$CXPOD_USER_CODEX_HOME" official openai "$profile"
+  set_current_auth_profile "$profile"
+  set_current_codex_app_auth_profile "$profile"
+  info "✅ 已写入 Codex.app/全局 CLI 登录态: $profile"
+}
+
+cmd_remove() {
+  local profile
+  profile="$(resolve_auth_profile "$1")"
+  local file
+  file="$(auth_profile_file "$profile")"
+  [[ -f "$file" ]] || die "账号不存在: $profile"
+  rm -f "$file"
+  [[ "$(current_auth_profile 2>/dev/null || true)" == "$profile" ]] && rm -f "$CXPOD_CURRENT_AUTH_PROFILE_FILE"
+  [[ "$(current_codex_app_auth_profile 2>/dev/null || true)" == "$profile" ]] && rm -f "$CXPOD_CODEX_APP_AUTH_PROFILE_FILE"
+  info "✅ 已删除 GPT 账号: $profile"
+}
+
+ensure_runtime_dirs
+
+case "${1:-}" in
+  -h|--help|"") usage; exit 0 ;;
+  -l|--list) list_profiles_pretty; exit 0 ;;
+  login)
+    [[ $# -eq 2 ]] || { usage; exit 1; }
+    cmd_login "$2"
+    ;;
+  save)
+    [[ $# -eq 2 ]] || { usage; exit 1; }
+    cmd_save "$2"
+    ;;
+  use)
+    [[ $# -eq 2 ]] || { usage; exit 1; }
+    cmd_use "$2"
+    ;;
+  install)
+    [[ $# -eq 2 ]] || { usage; exit 1; }
+    cmd_install "$2"
+    ;;
+  remove|rm)
+    [[ $# -eq 2 ]] || { usage; exit 1; }
+    cmd_remove "$2"
+    ;;
+  current)
+    current_auth_profile
+    echo
+    ;;
+  *)
+    die "未知命令: $1"
+    ;;
+esac

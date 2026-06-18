@@ -5,9 +5,11 @@ struct ProviderInfo {
     let id: String
     let displayName: String
     let badgeEmoji: String
+    let kind: String
     let source: URL       // file path
 
     var badge: String { "\(badgeEmoji) \(displayName)" }
+    var isOfficial: Bool { kind == "official" }
 }
 
 /// Discovers provider JSON files from two locations:
@@ -21,6 +23,10 @@ final class ProviderManager {
 
     func availableProviders() -> [String] {
         providers.map(\.id)
+    }
+
+    func officialProviderIDs() -> [String] {
+        providers.filter(\.isOfficial).map(\.id)
     }
 
     func currentProvider() -> String? {
@@ -120,8 +126,9 @@ final class ProviderManager {
                 let id = obj["id"] as? String ?? name
                 let dn = obj["display_name"] as? String ?? id
                 let emoji = obj["badge_emoji"] as? String ?? "⚪"
+                let kind = obj["kind"] as? String ?? "relay"
                 newProviders.append(ProviderInfo(
-                    id: id, displayName: dn, badgeEmoji: emoji, source: file
+                    id: id, displayName: dn, badgeEmoji: emoji, kind: kind, source: file
                 ))
             }
         }
