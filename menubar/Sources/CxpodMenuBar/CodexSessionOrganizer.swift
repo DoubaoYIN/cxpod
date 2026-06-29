@@ -162,6 +162,13 @@ final class CodexSessionOrganizer {
     var unassignedPath: String { unassignedURL.path }
     var deletedProjectPath: String { deletedProjectURL.path }
 
+    func sidebarStateFingerprint() -> String {
+        [
+            fileFingerprint(globalStateURL),
+            fileFingerprint(configURL)
+        ].joined(separator: "|")
+    }
+
     func readThreads(includeArchived: Bool) throws -> [CodexSessionThread] {
         let whereClause = includeArchived ? "" : "WHERE archived = 0"
         let sql = """
@@ -927,6 +934,15 @@ final class CodexSessionOrganizer {
     private func sqlQuote(_ value: String) -> String {
         "'\(value.replacingOccurrences(of: "'", with: "''"))'"
     }
+
+    private func fileFingerprint(_ url: URL) -> String {
+        guard let attributes = try? fm.attributesOfItem(atPath: url.path) else {
+            return "\(url.path):missing"
+        }
+        let size = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+        let modifiedAt = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        return "\(url.path):\(size):\(modifiedAt)"
+    }
 }
 
 final class CodexSessionOrganizerViewModel: ObservableObject {
@@ -946,6 +962,7 @@ final class CodexSessionOrganizerViewModel: ObservableObject {
 
     private let organizer: CodexSessionOrganizer
     private var originalThreads: [CodexSessionThread] = []
+    private var lastSidebarStateFingerprint: String?
 
     init(organizer: CodexSessionOrganizer = CodexSessionOrganizer()) {
         self.organizer = organizer
@@ -997,6 +1014,7 @@ final class CodexSessionOrganizerViewModel: ObservableObject {
             let newProjects = organizer.projects(from: displayThreads)
             threads = displayThreads
             projects = newProjects
+            lastSidebarStateFingerprint = organizer.sidebarStateFingerprint()
             if selectedProjectID == nil || !newProjects.contains(where: { $0.id == selectedProjectID }) {
                 selectedProjectID = newProjects.first?.id
             }
@@ -1005,6 +1023,18 @@ final class CodexSessionOrganizerViewModel: ObservableObject {
         } catch {
             errorText = error.localizedDescription
         }
+    }
+
+    func reloadIfSidebarStateChanged() {
+        let fingerprint = organizer.sidebarStateFingerprint()
+        guard let lastSidebarStateFingerprint else {
+            self.lastSidebarStateFingerprint = fingerprint
+            return
+        }
+        guard fingerprint != lastSidebarStateFingerprint else { return }
+        guard selectedThreadIDs.isEmpty, cutThreadIDs.isEmpty else { return }
+        reload()
+        statusText = "已自动更新项目列表"
     }
 
     func createProjectFromPrompt() {
@@ -1304,6 +1334,7 @@ final class CodexSessionOrganizerViewModel: ObservableObject {
 
 struct CodexSessionOrganizerView: View {
     @StateObject private var vm = CodexSessionOrganizerViewModel()
+    private let sidebarRefreshTimer = Timer.publish(every: 10, on: .main, in: .common).autoconnect()
 
     var body: some View {
         HStack(spacing: 0) {
@@ -1313,6 +1344,9 @@ struct CodexSessionOrganizerView: View {
         }
         .frame(minWidth: 860, minHeight: 560)
         .onAppear { vm.reload() }
+        .onReceive(sidebarRefreshTimer) { _ in
+            vm.reloadIfSidebarStateChanged()
+        }
         .onReceive(NotificationCenter.default.publisher(for: .codexOrganizerSelectAll)) { _ in
             vm.selectAllVisibleThreads()
         }
