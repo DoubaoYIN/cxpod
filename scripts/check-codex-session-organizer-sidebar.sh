@@ -58,6 +58,33 @@ func writeSavedConfig(home: URL, pendingThreadProjects: [String: String]) throws
     ], to: configURL)
 }
 
+@discardableResult
+func runSQLite(dbPath: String, sql: String) throws -> String {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+    process.arguments = [dbPath]
+    let stdin = Pipe()
+    let stdout = Pipe()
+    let stderr = Pipe()
+    process.standardInput = stdin
+    process.standardOutput = stdout
+    process.standardError = stderr
+    try process.run()
+    stdin.fileHandleForWriting.write(Data(sql.utf8))
+    stdin.fileHandleForWriting.closeFile()
+    let output = stdout.fileHandleForReading.readDataToEndOfFile()
+    let errorOutput = stderr.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    if process.terminationStatus != 0 {
+        throw NSError(
+            domain: "cxpod.organizer.sidebar-check.sqlite",
+            code: Int(process.terminationStatus),
+            userInfo: [NSLocalizedDescriptionKey: String(data: errorOutput, encoding: .utf8) ?? "sqlite failed"]
+        )
+    }
+    return String(data: output, encoding: .utf8) ?? ""
+}
+
 func makeThread(id: String, cwd: String, updatedAtMs: Int64 = 0) -> CodexSessionThread {
     CodexSessionThread(
         id: id,
@@ -137,10 +164,53 @@ func checkPendingMovesOverrideDisplay() throws {
     expect(projects.first { $0.path == unassignedPath }?.count == 1, "pending unassigned count mismatch")
 }
 
+func checkReadThreadsDrainsLargeSQLiteOutput() throws {
+    let home = try makeHome(globalState: [
+        "project-order": [],
+        "projectless-thread-ids": [],
+        "thread-workspace-root-hints": [:]
+    ])
+    defer { try? FileManager.default.removeItem(at: home) }
+
+    let dbPath = home.appendingPathComponent(".codex/state_5.sqlite").path
+    try runSQLite(dbPath: dbPath, sql: """
+    CREATE TABLE threads (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        first_user_message TEXT NOT NULL DEFAULT '',
+        preview TEXT NOT NULL DEFAULT '',
+        cwd TEXT NOT NULL,
+        model_provider TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        updated_at_ms INTEGER,
+        archived INTEGER NOT NULL DEFAULT 0,
+        rollout_path TEXT NOT NULL
+    );
+    """)
+
+    let largeText = String(repeating: "会话内容-", count: 500)
+    let rows = (1...180).map { index in
+        let id = String(format: "large-%03d", index)
+        let escaped = largeText.replacingOccurrences(of: "'", with: "''")
+        return "('\(id)','\(escaped)','\(escaped)','\(escaped)','/tmp/project','test',\(index),\(index * 1000),0,'')"
+    }.joined(separator: ",")
+    try runSQLite(dbPath: dbPath, sql: """
+    INSERT INTO threads (
+        id, title, first_user_message, preview, cwd, model_provider,
+        updated_at, updated_at_ms, archived, rollout_path
+    ) VALUES \(rows);
+    """)
+
+    let organizer = CodexSessionOrganizer(home: home, checksCodexRunning: false)
+    let threads = try organizer.readThreads(includeArchived: false)
+    expect(threads.count == 180, "large readThreads output was not fully drained")
+}
+
 do {
     try checkProjectOrderFiltering()
     try checkPendingMovesOverrideDisplay()
-    print("ok: organizer sidebar project-order check passed")
+    try checkReadThreadsDrainsLargeSQLiteOutput()
+    print("ok: organizer sidebar and large-read checks passed")
 } catch {
     fail(String(describing: error))
 }

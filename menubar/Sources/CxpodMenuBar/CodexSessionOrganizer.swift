@@ -771,12 +771,31 @@ final class CodexSessionOrganizer {
         process.standardError = stderr
         do {
             try process.run()
-            process.waitUntilExit()
         } catch {
             throw CodexSessionOrganizerError.sqliteFailed(error.localizedDescription)
         }
-        let output = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let errorText = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+        let group = DispatchGroup()
+        var outputData = Data()
+        var errorData = Data()
+
+        group.enter()
+        DispatchQueue.global(qos: .utility).async {
+            outputData = stdout.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
+        }
+
+        group.enter()
+        DispatchQueue.global(qos: .utility).async {
+            errorData = stderr.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
+        }
+
+        process.waitUntilExit()
+        group.wait()
+
+        let output = String(data: outputData, encoding: .utf8) ?? ""
+        let errorText = String(data: errorData, encoding: .utf8) ?? ""
         guard process.terminationStatus == 0 else {
             throw CodexSessionOrganizerError.sqliteFailed(errorText.trimmingCharacters(in: .whitespacesAndNewlines))
         }
