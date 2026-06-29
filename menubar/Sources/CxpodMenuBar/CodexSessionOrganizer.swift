@@ -571,8 +571,7 @@ final class CodexSessionOrganizer {
     }
 
     private func shortenedTitle(_ title: String, maxLength: Int = 36) -> String {
-        guard title.count > maxLength else { return title }
-        let stopCharacters = Set("。！？!?；;：:")
+        let stopCharacters = Set("。！？!?；;：:，,")
         var bestStop: String.Index?
         var index = title.startIndex
         var offset = 0
@@ -589,6 +588,8 @@ final class CodexSessionOrganizer {
                 .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
             if !prefix.isEmpty { return prefix }
         }
+
+        guard title.count > maxLength else { return title }
 
         let end = title.index(title.startIndex, offsetBy: maxLength)
         return String(title[..<end])
@@ -943,8 +944,12 @@ final class CodexSessionOrganizerViewModel: ObservableObject {
     @Published var pendingMoves: [String: String] = [:]
     @Published var cutThreadIDs = Set<String>()
 
-    private let organizer = CodexSessionOrganizer()
+    private let organizer: CodexSessionOrganizer
     private var originalThreads: [CodexSessionThread] = []
+
+    init(organizer: CodexSessionOrganizer = CodexSessionOrganizer()) {
+        self.organizer = organizer
+    }
 
     var selectedProject: CodexSessionProject? {
         projects.first { $0.id == selectedProjectID } ?? projects.first
